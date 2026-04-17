@@ -1,0 +1,11 @@
+# Minimal Python dependencies for the standalone RL module.
+# SUMO itself must still be installed separately and available through `sumo`
+# plus either SUMO_HOME, SUMO_TOOLS, or /usr/share/sumo/tools.
+pandas
+numpy
+torch
+tensordict
+torchrl
+traci
+libtraci
+sumolib

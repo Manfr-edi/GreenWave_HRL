@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+sumoenv/routes_rl_module_randomized/
+rl_module/history/
+rl_module/details/
+rl_module/evaluation_reports/
+sumoenv/output/
+*.log
+sumo_log.txt

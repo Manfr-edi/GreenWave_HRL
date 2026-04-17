@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="${STATICPATH}/full.net.xml"/>
+        <route-files value="${ROUTEFILEPATH}/generatedRoutes.rou.xml"/>
+        <additional-files value="${DETECTORPATH}/e2Detector.xml"/>
+    </input>
+
+	<time> 
+		<end value="3600" />
+	</time>
+
+    <output>
+        <tripinfo-output value="${TYPEPATH}/output/tripinfos.xml"/>
+        <save-state.prefix value="state"/>
+		<!--<fcd-output value="/output/fcd.xml"/> -->
+		<vehroute-output value="${TYPEPATH}/output/vehroute.xml" />
+		<summary-output value="${TYPEPATH}/output/summary.xml" />
+		<!--<queue-output value="../../${TYPEPATH}/output/queue.xml" /> -->
+		<edgedata-output value="${TYPEPATH}/output/edgedata-output.xml" />
+		<emission-output value="${TYPEPATH}/output/emission-output.xml" />
+    </output>
+
+    <report>
+        <log value="sumo_log.txt"/>
+        <no-step-log value="true"/>
+    </report>
+
+    <emissions>
+        <phemlight-path value="./PHEMlight/"/>
+    </emissions>
+
+
+    <processing>  
+		<!-- <threads value="8" /> -->
+		<!--<route-steps value="500" /> -->
+        <!-- <ignore-route-errors value="true"/>  IGNORA PERCORSI CON ERRORI  -->
+        <time-to-teleport value="-1"/> <!--  DISABILITA TELETRASPORTO -->
+		<ignore-junction-blocker value="1"/> <!-- NON ASPETTARE DI ENTRARE NELLA ROTONDA/INCROCIO SE LA STRADA è LIBERA --> 
+    </processing> 
+	
+
+	
+
+	
+</configuration>

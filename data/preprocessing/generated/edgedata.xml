@@ -1,0 +1,22 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<data>
+  <interval begin="0" end="3600">
+    <edge id="33831428#4" entered="24" />
+    <edge id="-260481406#6" entered="141" />
+    <edge id="32497485#0" entered="136" />
+    <edge id="23275450#0" entered="63" />
+    <edge id="-183743755" entered="101" />
+    <edge id="-32942500#1" entered="110" />
+    <edge id="23276104" entered="44" />
+    <edge id="23289049#0" entered="45" />
+    <edge id="25155146#2" entered="165" />
+    <edge id="23288767#4" entered="105" />
+    <edge id="-135982498#4" entered="45" />
+    <edge id="260481406#7" entered="288" />
+    <edge id="-236093055#1" entered="32" />
+    <edge id="23218857" entered="49" />
+    <edge id="-260481406#13" entered="98" />
+    <edge id="80655879#1" entered="125" />
+    <edge id="23185864#0" entered="277" />
+  </interval>
+</data>
