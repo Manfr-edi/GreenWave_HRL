@@ -24,14 +24,14 @@ class ExperimentSettings:
     """Episode count, output names, and reproducibility settings for training."""
 
     name: str = "coordinated_controller"
-    start_date: datetime = datetime(2024, 2, 1)
+    start_date: datetime = datetime(2025, 1, 1)
     # This is the target number of training episodes, not a calendar-day window.
     train_days: int = 200
     focus_hours: tuple[int, ...] = (7, 8)
     # Supported values: all, weekdays, weekends, or explicit weekdays like "mon-wed-sat".
     day_filter: str = "mon-wed-sat"
     train_on_same_day: bool = False
-    shuffle_episode_schedule: bool = True
+    shuffle_episode_schedule: bool = False
     global_seed: int = 42
     selected_taz_id: str | None = None
 

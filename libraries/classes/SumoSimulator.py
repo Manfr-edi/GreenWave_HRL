@@ -85,6 +85,11 @@ class Simulator:
             return
         outputpath = os.path.abspath(self.configurationPath + "/output")
         os.makedirs(outputpath, exist_ok=True)
+        # Some SUMO additional files, notably static/e2Detector.xml, write
+        # detector output with a path relative to the additional-file folder
+        # ("../output/..."). Create the canonical SUMO output root up front so
+        # SUMO does not abort before TraCI can connect.
+        os.makedirs(SUMO_OUTPUT_PATH, exist_ok=True)
 
         os.environ["STATICPATH"] = SUMO_NETWORK_PATH
         self.listener = ValueListener()
@@ -347,6 +352,10 @@ class Simulator:
             print("Error: the given path does not exist.")
             return
         self.detectorPath = detectorPath
+        # E2 detector files can contain output paths relative to DETECTORPATH.
+        # For the current static/e2Detector.xml this resolves to
+        # <detectorPath>/../output/e2_global_output.xml.
+        os.makedirs(os.path.abspath(os.path.join(detectorPath, os.pardir, "output")), exist_ok=True)
         os.environ["DETECTORPATH"] = detectorPath
         print("The path was set to " + detectorPath)
 

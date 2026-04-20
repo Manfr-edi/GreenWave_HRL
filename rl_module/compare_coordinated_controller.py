@@ -36,6 +36,7 @@ from rl_module.coordination import (
     build_taz_adjacency_matrix,
     compute_coordination_step_rewards,
     extract_taz_features,
+    parse_taz_polygons,
     summarize_step_actions,
 )
 from rl_module.environment import CoordinatedTazTrafficEnv
@@ -53,6 +54,25 @@ TRIPINFO_EMISSION_ATTRS = {
     "total_fuel": "fuel_abs",
     "total_co": "CO_abs",
 }
+EMISSION_OUTPUT_ATTRS = {
+    "total_co2": "CO2",
+    "total_nox": "NOx",
+    "total_fuel": "fuel",
+    "total_co": "CO",
+}
+COMPARISON_METRICS = (
+    "avg_waiting_time",
+    "total_waiting_time",
+    "total_co2",
+    "total_nox",
+    "total_fuel",
+    "total_co",
+    "co2_mean_per_active_taz",
+    "co2_max_taz_value",
+    "co2_taz_range",
+    "co2_taz_std",
+    "co2_taz_cv",
+)
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -115,11 +135,202 @@ def _parse_tripinfo_emission_totals(tripinfo_path: str) -> dict:
     }
 
 
-def _collect_run_metrics(run_root: str, waiting_components: dict | None = None) -> dict:
+def _empty_emissions_by_taz(taz_ids: list[str] | None) -> dict:
+    return {
+        str(taz_id): {**{metric_name: 0.0 for metric_name in EMISSION_OUTPUT_ATTRS}, "sample_count": 0}
+        for taz_id in (taz_ids or [])
+    }
+
+
+def _xml_local_name(tag: str) -> str:
+    return str(tag).rsplit("}", maxsplit=1)[-1]
+
+
+def _prepare_taz_lookup(taz_ids: list[str] | None, taz_polygons: dict[str, list[tuple[float, float]]] | None) -> list[dict]:
+    polygons = dict(taz_polygons or {})
+    ordered_taz_ids = [str(taz_id) for taz_id in (taz_ids or polygons.keys())]
+    lookup = []
+    for taz_id in ordered_taz_ids:
+        points = list(polygons.get(str(taz_id), []) or [])
+        if len(points) < 3:
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        lookup.append({
+            "taz_id": str(taz_id),
+            "points": points,
+            "bbox": (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))),
+        })
+    return lookup
+
+
+def _point_in_polygon(x: float, y: float, points: list[tuple[float, float]]) -> bool:
+    inside = False
+    j = len(points) - 1
+    for i, (xi, yi) in enumerate(points):
+        xj, yj = points[j]
+        intersects = (yi > y) != (yj > y)
+        if intersects:
+            x_intersection = (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi
+            if x <= x_intersection:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _assign_taz_from_point(x: float, y: float, taz_lookup: list[dict]) -> str | None:
+    for entry in taz_lookup:
+        min_x, min_y, max_x, max_y = entry["bbox"]
+        if x < min_x or x > max_x or y < min_y or y > max_y:
+            continue
+        if _point_in_polygon(x, y, entry["points"]):
+            return str(entry["taz_id"])
+    return None
+
+
+def _parse_emission_output_by_taz(
+    emission_output_path: str,
+    taz_ids: list[str] | None,
+    taz_polygons: dict[str, list[tuple[float, float]]] | None,
+) -> dict:
+    emissions_by_taz = _empty_emissions_by_taz(taz_ids)
+    taz_lookup = _prepare_taz_lookup(taz_ids, taz_polygons)
+    if not emission_output_path or not os.path.exists(emission_output_path) or not taz_lookup:
+        return {
+            "emissions_by_taz": emissions_by_taz,
+            "assigned_sample_count": 0,
+            "unassigned_sample_count": 0,
+            "ok": False,
+            "path": emission_output_path,
+            "source": "emission_output_xy_polygon",
+        }
+
+    assigned_sample_count = 0
+    unassigned_sample_count = 0
+    try:
+        for _, elem in ET.iterparse(emission_output_path, events=("end",)):
+            tag = _xml_local_name(elem.tag)
+            if tag == "vehicle":
+                x_raw = elem.get("x")
+                y_raw = elem.get("y")
+                if x_raw is None or y_raw is None:
+                    unassigned_sample_count += 1
+                    elem.clear()
+                    continue
+                x = _safe_float(x_raw, float("nan"))
+                y = _safe_float(y_raw, float("nan"))
+                if not np.isfinite(x) or not np.isfinite(y):
+                    unassigned_sample_count += 1
+                    elem.clear()
+                    continue
+                taz_id = _assign_taz_from_point(x, y, taz_lookup)
+                if taz_id is None:
+                    unassigned_sample_count += 1
+                    elem.clear()
+                    continue
+                bucket = emissions_by_taz.setdefault(
+                    str(taz_id),
+                    {**{metric_name: 0.0 for metric_name in EMISSION_OUTPUT_ATTRS}, "sample_count": 0},
+                )
+                for metric_name, attr_name in EMISSION_OUTPUT_ATTRS.items():
+                    bucket[metric_name] = float(bucket.get(metric_name, 0.0)) + _safe_float(elem.get(attr_name), 0.0)
+                bucket["sample_count"] = int(bucket.get("sample_count", 0)) + 1
+                assigned_sample_count += 1
+                elem.clear()
+            elif tag == "timestep":
+                elem.clear()
+    except Exception:
+        return {
+            "emissions_by_taz": emissions_by_taz,
+            "assigned_sample_count": int(assigned_sample_count),
+            "unassigned_sample_count": int(unassigned_sample_count),
+            "ok": False,
+            "path": emission_output_path,
+            "source": "emission_output_xy_polygon",
+        }
+
+    return {
+        "emissions_by_taz": emissions_by_taz,
+        "assigned_sample_count": int(assigned_sample_count),
+        "unassigned_sample_count": int(unassigned_sample_count),
+        "ok": bool(assigned_sample_count > 0),
+        "path": emission_output_path,
+        "source": "emission_output_xy_polygon",
+    }
+
+
+def _summarize_emissions_by_taz(emissions_by_taz: dict, taz_ids: list[str] | None) -> dict:
+    ordered_taz_ids = [str(taz_id) for taz_id in (taz_ids or emissions_by_taz.keys())]
+    summary = {}
+    for metric_name in EMISSION_OUTPUT_ATTRS:
+        active_values = [
+            (taz_id, float((emissions_by_taz.get(taz_id, {}) or {}).get(metric_name, 0.0)))
+            for taz_id in ordered_taz_ids
+            if float((emissions_by_taz.get(taz_id, {}) or {}).get("sample_count", 0)) > 0.0
+        ]
+        if not active_values:
+            summary[metric_name] = {
+                "mean_per_active_taz": None,
+                "min_taz": None,
+                "min_value": None,
+                "max_taz": None,
+                "max_value": None,
+                "range": None,
+                "std": None,
+                "coefficient_of_variation": None,
+                "active_taz_count": 0,
+                "configured_taz_count": int(len(ordered_taz_ids)),
+            }
+            continue
+        values = np.array([value for _, value in active_values], dtype=np.float64)
+        min_taz, min_value = min(active_values, key=lambda item: item[1])
+        max_taz, max_value = max(active_values, key=lambda item: item[1])
+        mean_value = float(values.mean())
+        std_value = float(values.std())
+        summary[metric_name] = {
+            "mean_per_active_taz": mean_value,
+            "min_taz": str(min_taz),
+            "min_value": float(min_value),
+            "max_taz": str(max_taz),
+            "max_value": float(max_value),
+            "range": float(max_value - min_value),
+            "std": std_value,
+            "coefficient_of_variation": float(std_value / mean_value) if abs(mean_value) > 1e-9 else None,
+            "active_taz_count": int(len(active_values)),
+            "configured_taz_count": int(len(ordered_taz_ids)),
+        }
+    return summary
+
+
+def _co2_taz_aliases(emission_taz_summary: dict) -> dict:
+    co2_summary = dict((emission_taz_summary or {}).get("total_co2", {}) or {})
+    return {
+        "co2_mean_per_active_taz": co2_summary.get("mean_per_active_taz"),
+        "co2_min_taz": co2_summary.get("min_taz"),
+        "co2_min_taz_value": co2_summary.get("min_value"),
+        "co2_max_taz": co2_summary.get("max_taz"),
+        "co2_max_taz_value": co2_summary.get("max_value"),
+        "co2_taz_range": co2_summary.get("range"),
+        "co2_taz_std": co2_summary.get("std"),
+        "co2_taz_cv": co2_summary.get("coefficient_of_variation"),
+        "emission_active_taz_count": int(co2_summary.get("active_taz_count", 0) or 0),
+        "emission_configured_taz_count": int(co2_summary.get("configured_taz_count", 0) or 0),
+    }
+
+
+def _collect_run_metrics(
+    run_root: str,
+    waiting_components: dict | None = None,
+    taz_ids: list[str] | None = None,
+    taz_polygons: dict[str, list[tuple[float, float]]] | None = None,
+) -> dict:
     output_dir = os.path.join(run_root, "output")
     waiting = dict(waiting_components or {})
     tripinfo_path = str(waiting.get("tripinfo_path") or os.path.join(output_dir, "tripinfos.xml"))
+    emission_output_path = os.path.join(output_dir, "emission-output.xml")
     emissions = _parse_tripinfo_emission_totals(tripinfo_path)
+    emissions_by_taz_payload = _parse_emission_output_by_taz(emission_output_path, taz_ids, taz_polygons)
+    emission_taz_summary = _summarize_emissions_by_taz(emissions_by_taz_payload["emissions_by_taz"], taz_ids)
     return {
         "trip_count": int(waiting.get("trip_count", 0)),
         "tripinfo_count": int(emissions["tripinfo_count"]),
@@ -128,8 +339,15 @@ def _collect_run_metrics(run_root: str, waiting_components: dict | None = None) 
         "total_waiting_time": float(waiting.get("total_waiting_time", 0.0)),
         "waiting_metric_source": str(waiting.get("waiting_metric_source", "unknown")),
         "emission_metric_source": "tripinfo_emissions_abs",
+        "emission_taz_metric_source": emissions_by_taz_payload["source"],
         "waiting_time_by_taz": dict(waiting.get("waiting_time_by_taz", {}) or {}),
         "vehicle_count_by_taz": dict(waiting.get("vehicle_count_by_taz", {}) or {}),
+        "emissions_by_taz": emissions_by_taz_payload["emissions_by_taz"],
+        "emission_taz_summary": emission_taz_summary,
+        "emission_taz_parse_ok": bool(emissions_by_taz_payload["ok"]),
+        "emission_assigned_sample_count": int(emissions_by_taz_payload["assigned_sample_count"]),
+        "emission_unassigned_sample_count": int(emissions_by_taz_payload["unassigned_sample_count"]),
+        **_co2_taz_aliases(emission_taz_summary),
         "total_co2": float(emissions["total_co2"]),
         "total_nox": float(emissions["total_nox"]),
         "total_fuel": float(emissions["total_fuel"]),
@@ -137,7 +355,7 @@ def _collect_run_metrics(run_root: str, waiting_components: dict | None = None) 
         "ok": bool(waiting.get("parse_ok", False) and emissions["ok"]),
         "tripinfo_path": tripinfo_path,
         "emission_path": tripinfo_path,
-        "emission_output_path": os.path.join(output_dir, "emission-output.xml"),
+        "emission_output_path": emission_output_path,
     }
 
 
@@ -392,24 +610,65 @@ def _run_rl_episode(env, bundle: dict, adjacency_matrix: torch.Tensor, episode: 
     }
 
 
-def _metric_comparison(baseline_value: float, rl_value: float) -> dict:
-    delta = float(rl_value - baseline_value)
-    improvement = float(baseline_value - rl_value)
-    improvement_pct = float(improvement / baseline_value * 100.0) if abs(baseline_value) > 1e-9 else None
-    return {"baseline": float(baseline_value), "rl": float(rl_value), "delta_rl_minus_baseline": delta, "improvement_vs_baseline": improvement, "improvement_pct": improvement_pct}
+def _is_number(value) -> bool:
+    try:
+        parsed = float(value)
+    except Exception:
+        return False
+    return bool(np.isfinite(parsed))
 
 
-def _build_comparison(baseline_metrics: dict, rl_metrics: dict) -> dict:
+def _metric_comparison(reference_value: float, candidate_value: float, reference_name: str = "baseline", candidate_name: str = "rl") -> dict:
+    reference = float(reference_value)
+    candidate = float(candidate_value)
+    delta = float(candidate - reference)
+    improvement = float(reference - candidate)
+    improvement_pct = float(improvement / reference * 100.0) if abs(reference) > 1e-9 else None
     return {
-        metric: _metric_comparison(baseline_metrics[metric], rl_metrics[metric])
-        for metric in ("avg_waiting_time", "total_waiting_time", "total_co2", "total_nox", "total_fuel", "total_co")
+        "reference_name": str(reference_name),
+        "candidate_name": str(candidate_name),
+        "reference": reference,
+        "candidate": candidate,
+        "baseline": reference,
+        "rl": candidate,
+        "delta_candidate_minus_reference": delta,
+        "delta_rl_minus_baseline": delta,
+        "improvement_vs_reference": improvement,
+        "improvement_vs_baseline": improvement,
+        "improvement_pct": improvement_pct,
+    }
+
+
+def _build_comparison(baseline_metrics: dict, rl_metrics: dict, reference_name: str = "baseline", candidate_name: str = "rl") -> dict:
+    return {
+        metric: _metric_comparison(baseline_metrics[metric], rl_metrics[metric], reference_name, candidate_name)
+        for metric in COMPARISON_METRICS
+        if _is_number(baseline_metrics.get(metric)) and _is_number(rl_metrics.get(metric))
     }
 
 
 def _aggregate_metrics(metrics_list: list[dict]) -> dict:
+    taz_ids = sorted({
+        str(taz_id)
+        for metrics in metrics_list
+        for taz_id in (metrics.get("emissions_by_taz", {}) or {}).keys()
+    })
+
     def _mean(key: str) -> float:
         return float(np.mean([_safe_float(metrics.get(key), 0.0) for metrics in metrics_list]))
 
+    def _mean_optional(key: str):
+        values = [float(metrics.get(key)) for metrics in metrics_list if _is_number(metrics.get(key))]
+        return float(np.mean(values)) if values else None
+
+    emissions_by_taz = _empty_emissions_by_taz(taz_ids)
+    for taz_id in taz_ids:
+        buckets = [dict((metrics.get("emissions_by_taz", {}) or {}).get(taz_id, {}) or {}) for metrics in metrics_list]
+        for metric_name in EMISSION_OUTPUT_ATTRS:
+            emissions_by_taz[taz_id][metric_name] = float(np.mean([_safe_float(bucket.get(metric_name), 0.0) for bucket in buckets]))
+        emissions_by_taz[taz_id]["sample_count"] = float(np.mean([_safe_float(bucket.get("sample_count"), 0.0) for bucket in buckets]))
+
+    emission_taz_summary = _summarize_emissions_by_taz(emissions_by_taz, taz_ids)
     return {
         "run_count": int(len(metrics_list)),
         "trip_count": _mean("trip_count"),
@@ -421,17 +680,58 @@ def _aggregate_metrics(metrics_list: list[dict]) -> dict:
         "total_nox": _mean("total_nox"),
         "total_fuel": _mean("total_fuel"),
         "total_co": _mean("total_co"),
+        "emissions_by_taz": emissions_by_taz,
+        "emission_taz_summary": emission_taz_summary,
+        "emission_taz_parse_ok": bool(all(bool(metrics.get("emission_taz_parse_ok", False)) for metrics in metrics_list)),
+        "emission_assigned_sample_count": _mean_optional("emission_assigned_sample_count"),
+        "emission_unassigned_sample_count": _mean_optional("emission_unassigned_sample_count"),
+        **_co2_taz_aliases(emission_taz_summary),
         "ok": bool(all(bool(metrics.get("ok", False)) for metrics in metrics_list)),
         "run_dirs": [str(metrics.get("run_dir", "")) for metrics in metrics_list],
     }
 
 
+def _format_optional_float(value) -> str:
+    return "n/a" if not _is_number(value) else f"{float(value):.4f}"
+
+
+def _print_taz_emission_summary(report: dict):
+    section_names = [
+        "baseline",
+        "local_greedy",
+        "local_stochastic_mean",
+        "coordinated_greedy",
+        "coordinated_stochastic_mean",
+    ]
+    print("CO2 per TAZ")
+    for section_name in section_names:
+        metrics = report.get(section_name)
+        if not metrics:
+            continue
+        summary = dict((metrics.get("emission_taz_summary", {}) or {}).get("total_co2", {}) or {})
+        if not summary or not summary.get("active_taz_count"):
+            print(f"{section_name}: n/a")
+            continue
+        print(
+            f"{section_name}: mean={_format_optional_float(summary.get('mean_per_active_taz'))} | "
+            f"min={summary.get('min_taz')}:{_format_optional_float(summary.get('min_value'))} | "
+            f"max={summary.get('max_taz')}:{_format_optional_float(summary.get('max_value'))} | "
+            f"range={_format_optional_float(summary.get('range'))} | std={_format_optional_float(summary.get('std'))} | "
+            f"cv={_format_optional_float(summary.get('coefficient_of_variation'))} | "
+            f"active_taz={summary.get('active_taz_count')}/{summary.get('configured_taz_count')}"
+        )
+    print("")
+
+
 def _print_summary(report: dict):
+    _print_taz_emission_summary(report)
     section_names = [
         "comparison_local_greedy",
         "comparison_local_stochastic_mean",
         "comparison_coordinated_greedy",
         "comparison_coordinated_stochastic_mean",
+        "comparison_coordinated_vs_local_greedy",
+        "comparison_coordinated_vs_local_stochastic_mean",
     ]
     for section_name in section_names:
         if section_name not in report:
@@ -440,9 +740,12 @@ def _print_summary(report: dict):
         for metric_name, values in report[section_name].items():
             pct = values.get("improvement_pct")
             pct_text = "n/a" if pct is None else f"{pct:.2f}%"
+            reference_name = values.get("reference_name", "baseline")
+            candidate_name = values.get("candidate_name", "rl")
             print(
-                f"{metric_name}: baseline={values['baseline']:.4f} | rl={values['rl']:.4f} | "
-                f"delta={values['delta_rl_minus_baseline']:.4f} | improvement={values['improvement_vs_baseline']:.4f} | improvement_pct={pct_text}"
+                f"{metric_name}: {reference_name}={values['reference']:.4f} | {candidate_name}={values['candidate']:.4f} | "
+                f"delta={values['delta_candidate_minus_reference']:.4f} | "
+                f"improvement={values['improvement_vs_reference']:.4f} | improvement_pct={pct_text}"
             )
         print("")
 
@@ -511,8 +814,10 @@ def main():
     try:
         route_folder_path, generated = ensure_routes(episode, planner, DEMAND)
         print(f"[ROUTES] {'generated' if generated else 'cached'} | {route_folder_path}")
+        taz_ids = env.get_taz_ids()
+        taz_polygons = parse_taz_polygons(constants.TAZ_ADDITIONAL_FILE_PATH)
         adjacency_matrix, adjacency_metadata = build_taz_adjacency_matrix(
-            taz_ids=env.get_taz_ids(),
+            taz_ids=taz_ids,
             taz_additional_path=constants.TAZ_ADDITIONAL_FILE_PATH,
             distance_threshold=COORDINATOR.taz_adjacency_distance_threshold,
             fallback_k=COORDINATOR.taz_adjacency_fallback_k,
@@ -525,7 +830,12 @@ def main():
         sumo.changeRouteFilePath(route_folder_path)
         sumo.changeTypePath(baseline_run_dir)
         _, baseline_components = env.run_reference_episode_no_agent(hour=episode.hour)
-        baseline_metrics = _collect_run_metrics(baseline_run_dir, waiting_components=baseline_components)
+        baseline_metrics = _collect_run_metrics(
+            baseline_run_dir,
+            waiting_components=baseline_components,
+            taz_ids=taz_ids,
+            taz_polygons=taz_polygons,
+        )
         baseline_metrics["run_dir"] = baseline_run_dir
         baseline_penalty = float(baseline_components.get("penalty", 0.0)) if baseline_components.get("parse_ok", False) else None
 
@@ -537,7 +847,12 @@ def main():
             sumo.changeRouteFilePath(route_folder_path)
             sumo.changeTypePath(local_greedy_run_dir)
             rollout = _run_local_episode(env, local_bundle, episode, deterministic=True)
-            local_greedy_metrics = _collect_run_metrics(local_greedy_run_dir, waiting_components=rollout["terminal_reward"])
+            local_greedy_metrics = _collect_run_metrics(
+                local_greedy_run_dir,
+                waiting_components=rollout["terminal_reward"],
+                taz_ids=taz_ids,
+                taz_polygons=taz_polygons,
+            )
             local_greedy_metrics["run_dir"] = local_greedy_run_dir
             local_greedy_metrics["local_rollout"] = rollout["local_rollout"]
             local_greedy_metrics["group_action_details"] = rollout["group_action_details"]
@@ -550,7 +865,12 @@ def main():
                 sumo.changeRouteFilePath(route_folder_path)
                 sumo.changeTypePath(run_dir)
                 rollout = _run_local_episode(env, local_bundle, episode, deterministic=False)
-                metrics = _collect_run_metrics(run_dir, waiting_components=rollout["terminal_reward"])
+                metrics = _collect_run_metrics(
+                    run_dir,
+                    waiting_components=rollout["terminal_reward"],
+                    taz_ids=taz_ids,
+                    taz_polygons=taz_polygons,
+                )
                 metrics["run_dir"] = run_dir
                 metrics["run_index"] = int(run_idx + 1)
                 metrics["local_rollout"] = rollout["local_rollout"]
@@ -565,7 +885,12 @@ def main():
             sumo.changeRouteFilePath(route_folder_path)
             sumo.changeTypePath(coordinated_greedy_run_dir)
             rollout = _run_rl_episode(env, coordinated_bundle, adjacency_matrix, episode, deterministic=True, baseline_penalty=baseline_penalty)
-            coordinated_greedy_metrics = _collect_run_metrics(coordinated_greedy_run_dir, waiting_components=rollout["terminal_reward"])
+            coordinated_greedy_metrics = _collect_run_metrics(
+                coordinated_greedy_run_dir,
+                waiting_components=rollout["terminal_reward"],
+                taz_ids=taz_ids,
+                taz_polygons=taz_polygons,
+            )
             coordinated_greedy_metrics["run_dir"] = coordinated_greedy_run_dir
             coordinated_greedy_metrics["coordination_rollout"] = rollout["coordination_rollout"]
             coordinated_greedy_metrics["group_action_details"] = rollout["group_action_details"]
@@ -578,7 +903,12 @@ def main():
                 sumo.changeRouteFilePath(route_folder_path)
                 sumo.changeTypePath(run_dir)
                 rollout = _run_rl_episode(env, coordinated_bundle, adjacency_matrix, episode, deterministic=False, baseline_penalty=baseline_penalty)
-                metrics = _collect_run_metrics(run_dir, waiting_components=rollout["terminal_reward"])
+                metrics = _collect_run_metrics(
+                    run_dir,
+                    waiting_components=rollout["terminal_reward"],
+                    taz_ids=taz_ids,
+                    taz_polygons=taz_polygons,
+                )
                 metrics["run_dir"] = run_dir
                 metrics["run_index"] = int(run_idx + 1)
                 metrics["coordination_rollout"] = rollout["coordination_rollout"]
@@ -597,7 +927,7 @@ def main():
             "architecture_name": "baseline_vs_local_vs_coordinated",
             "route_folder_path": route_folder_path,
             "route_generated": bool(generated),
-            "taz_ids": env.get_taz_ids(),
+            "taz_ids": taz_ids,
             "tls_ids": env.get_tls_ids(),
             "coordination_price_bins": list(coordinated_bundle["price_bins"]) if run_coordinated else None,
             "adjacency_metadata": adjacency_metadata,
@@ -611,16 +941,46 @@ def main():
                 "local_greedy": local_greedy_metrics,
                 "local_stochastic_runs": local_stochastic_runs,
                 "local_stochastic_mean": local_stochastic_mean,
-                "comparison_local_greedy": _build_comparison(baseline_metrics, local_greedy_metrics),
-                "comparison_local_stochastic_mean": _build_comparison(baseline_metrics, local_stochastic_mean),
+                "comparison_local_greedy": _build_comparison(baseline_metrics, local_greedy_metrics, "baseline", "local_greedy"),
+                "comparison_local_stochastic_mean": _build_comparison(
+                    baseline_metrics,
+                    local_stochastic_mean,
+                    "baseline",
+                    "local_stochastic_mean",
+                ),
             })
         if run_coordinated:
             report.update({
                 "coordinated_greedy": coordinated_greedy_metrics,
                 "coordinated_stochastic_runs": coordinated_stochastic_runs,
                 "coordinated_stochastic_mean": coordinated_stochastic_mean,
-                "comparison_coordinated_greedy": _build_comparison(baseline_metrics, coordinated_greedy_metrics),
-                "comparison_coordinated_stochastic_mean": _build_comparison(baseline_metrics, coordinated_stochastic_mean),
+                "comparison_coordinated_greedy": _build_comparison(
+                    baseline_metrics,
+                    coordinated_greedy_metrics,
+                    "baseline",
+                    "coordinated_greedy",
+                ),
+                "comparison_coordinated_stochastic_mean": _build_comparison(
+                    baseline_metrics,
+                    coordinated_stochastic_mean,
+                    "baseline",
+                    "coordinated_stochastic_mean",
+                ),
+            })
+        if run_local and run_coordinated:
+            report.update({
+                "comparison_coordinated_vs_local_greedy": _build_comparison(
+                    local_greedy_metrics,
+                    coordinated_greedy_metrics,
+                    "local_greedy",
+                    "coordinated_greedy",
+                ),
+                "comparison_coordinated_vs_local_stochastic_mean": _build_comparison(
+                    local_stochastic_mean,
+                    coordinated_stochastic_mean,
+                    "local_stochastic_mean",
+                    "coordinated_stochastic_mean",
+                ),
             })
         report_path = os.path.join(report_dir, "comparison_coordinated_controller.json")
         with open(report_path, "w", encoding="utf-8") as handle:

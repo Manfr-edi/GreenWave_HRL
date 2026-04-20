@@ -11,7 +11,7 @@ The module is organized around component roles:
 
 - `settings.py`: central configuration for experiment length, day filters, demand noise, environment parameters, PPO hyperparameters, and output paths.
 - `traffic_demand.py`: builds the training schedule, applies weekday filters, samples reproducible demand noise, and generates or reuses SUMO route caches.
-- `environment.py`: defines `CoordinatedTazTrafficEnv`, the SUMO environment wrapper with TAZ-to-TAZ flow tracking.
+- `environment.py`: defines the SUMO environment stack (`LocalTazTrafficEnv`, `GroupedTazTrafficEnv`, `CoordinatedTazTrafficEnv`) including TAZ observations, grouped TLS control, rewards, and TAZ-to-TAZ flow tracking.
 - `policy.py`: defines the shared multi-discrete actor-critic used by both the local controller and the coordinator.
 - `ppo.py`: contains PPO utilities, GAE computation, advantage normalization, entropy scheduling, seed setup, and optimizer-state helpers.
 - `coordination.py`: builds TAZ adjacency, coordinator observations, local price features, and coordination reward shaping.
@@ -190,3 +190,13 @@ The JSON report includes these sections when the corresponding run is enabled:
 - `comparison_local_stochastic_mean`
 - `comparison_coordinated_greedy`
 - `comparison_coordinated_stochastic_mean`
+- `comparison_coordinated_vs_local_greedy`
+- `comparison_coordinated_vs_local_stochastic_mean`
+
+Each run section also includes `emissions_by_taz` and `emission_taz_summary`.
+Global totals still come from `tripinfos.xml`; per-TAZ emissions are aggregated
+from `emission-output.xml` by assigning each vehicle sample to a TAZ polygon.
+The CO2 summary reports the mean emission per active TAZ, the lowest-emission
+TAZ, the highest-emission TAZ, and balance indicators (`range`, `std`, `cv`).
+Lower balance indicators in the coordinated run compared with the local-only
+run support the coordinator's TAZ-balancing effect.

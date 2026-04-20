@@ -142,7 +142,7 @@ class ScenarioGenerator:
             "-o",
             os.path.join(folder_path, "generatedRoutes.rou.xml"),
             "--edgedata-attribute",
-            "qPKW",
+            "entered",
             "--write-flows",
             "number",
             "--total-count",
