@@ -41,17 +41,22 @@ Supported `day_filter` values:
 
 Italian and English weekday aliases are accepted, for example `lun`, `mer`,
 `sab`, `mon`, `wed`, and `sat`.
+Dates without traffic-flow rows in the processed CSV are skipped automatically;
+the schedule continues scanning forward until it reaches `train_days`.
 
 Demand is randomized but reproducible. The base seed remains `42`, and demand
 noise is deterministically derived from the seed, episode index, date, and hour.
+Saturday and Sunday episodes also apply `weekend_demand_factor` from
+`settings.py`; if `weekend_hourly_profile` is configured, the weekend uses that
+hourly profile before applying the attenuation factor.
 Generated route caches are written under:
 
 ```text
 sumoenv/routes_rl_module_randomized/
 ```
 
-Each route path includes the vehicle count, demand-noise tag, base seed, and
-route seeds, so scenarios are explicit and reproducible.
+Each route path includes the day type, vehicle count, demand-noise tag, weekend
+factor, base seed, and route seeds, so scenarios are explicit and reproducible.
 
 ## Usage
 

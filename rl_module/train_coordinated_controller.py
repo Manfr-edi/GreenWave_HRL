@@ -184,7 +184,8 @@ def main():
             episode = resolve_episode_demand(episode_idx, day, hour, EXPERIMENT, DEMAND)
             print(
                 f"{episode_idx}: date={episode.simulation_date} slot={episode.timeslot} "
-                f"base={episode.base_vehicle_count} noise={episode.demand_noise:.4f} "
+                f"day_type={episode.day_type} base={episode.base_vehicle_count} "
+                f"day_factor={episode.day_type_demand_factor:.4f} noise={episode.demand_noise:.4f} "
                 f"vehicles={episode.vehicle_count} path={episode.route_folder_path}"
             )
         print(f"total_episodes={len(schedule)}")
@@ -266,7 +267,8 @@ def main():
     os.makedirs(EXPERIMENT.checkpoint_dir, exist_ok=True)
     os.makedirs(EXPERIMENT.detail_dir, exist_ok=True)
     csv_cols = [
-        "episode", "date", "timeslot", "hour", "base_vehicle_count", "demand_noise", "vehicle_count",
+        "episode", "date", "day_type", "timeslot", "hour", "hourly_profile_multiplier",
+        "day_type_demand_factor", "base_vehicle_count", "demand_noise", "vehicle_count",
         "terminal_penalty", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
         "coordination_adjustment_mean", "coordinator_reward_mean", "coordinator_price_mean",
         "coordinator_price_std", "spillover_mean", "imbalance_mean", "episode_flow_total",
@@ -295,7 +297,8 @@ def main():
         episode = resolve_episode_demand(episode_idx, day, hour, EXPERIMENT, DEMAND)
         print(
             f"\n[EP {episode_idx + 1}/{total_episodes}] date={episode.simulation_date} slot={episode.timeslot} "
-            f"vehicles={episode.vehicle_count} noise={episode.demand_noise:.4f}"
+            f"day_type={episode.day_type} vehicles={episode.vehicle_count} "
+            f"day_factor={episode.day_type_demand_factor:.4f} noise={episode.demand_noise:.4f}"
         )
         route_folder_path, generated = ensure_routes(episode, planner, DEMAND)
         print(f"[ROUTES] {'generated' if generated else 'cached'} | {route_folder_path}")
@@ -472,8 +475,11 @@ def main():
         row = {
             "episode": int(episode_idx),
             "date": episode.simulation_date,
+            "day_type": episode.day_type,
             "timeslot": episode.timeslot,
             "hour": int(episode.hour),
+            "hourly_profile_multiplier": float(episode.hourly_profile_multiplier),
+            "day_type_demand_factor": float(episode.day_type_demand_factor),
             "base_vehicle_count": int(episode.base_vehicle_count),
             "demand_noise": float(episode.demand_noise),
             "vehicle_count": int(episode.vehicle_count),

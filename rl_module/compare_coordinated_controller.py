@@ -42,7 +42,7 @@ from rl_module.coordination import (
 from rl_module.environment import CoordinatedTazTrafficEnv
 from rl_module.policy import MultiDiscreteActorCritic
 from rl_module.settings import COORDINATOR, DEMAND, ENVIRONMENT, EXPERIMENT, LOCAL_CONTROLLER, PACKAGE_DIR
-from rl_module.traffic_demand import EpisodeDemand, ensure_routes, resolve_episode_demand
+from rl_module.traffic_demand import EpisodeDemand, build_route_cache_folder, ensure_routes, resolve_episode_demand
 
 
 DEFAULT_CHECKPOINT_PATH = os.path.join(PACKAGE_DIR, "checkpoints", "coordinated_controller", "coordinated_controller_best.pt")
@@ -364,22 +364,37 @@ def _evaluation_episode(simulation_date: str, hour: int, episode_index: int, dem
     episode = resolve_episode_demand(episode_index, day, hour, EXPERIMENT, DEMAND)
     if demand_noise_override is None:
         return episode
-    vehicle_count = max(1, int(round(episode.base_vehicle_count * float(demand_noise_override))))
+    vehicle_count = max(1, int(round(
+        episode.base_vehicle_count * float(demand_noise_override) * episode.day_type_demand_factor
+    )))
+    route_folder_path = build_route_cache_folder(
+        DEMAND.route_cache_root,
+        episode.simulation_date,
+        episode.timeslot_clean,
+        episode.day_type,
+        vehicle_count,
+        float(demand_noise_override),
+        episode.day_type_demand_factor,
+        EXPERIMENT.global_seed,
+        episode.random_trip_seed,
+        episode.route_sampler_seed,
+        DEMAND.route_sampler_threads,
+    )
     return EpisodeDemand(
         episode_idx=int(episode_index),
         simulation_date=episode.simulation_date,
+        day_type=episode.day_type,
         hour=episode.hour,
         timeslot=episode.timeslot,
         timeslot_clean=episode.timeslot_clean,
+        hourly_profile_multiplier=episode.hourly_profile_multiplier,
+        day_type_demand_factor=episode.day_type_demand_factor,
         base_vehicle_count=episode.base_vehicle_count,
         demand_noise=float(demand_noise_override),
         vehicle_count=vehicle_count,
         random_trip_seed=episode.random_trip_seed,
         route_sampler_seed=episode.route_sampler_seed,
-        route_folder_path=episode.route_folder_path.replace(f"demand_{episode.vehicle_count}", f"demand_{vehicle_count}").replace(
-            f"noise_{episode.demand_noise:.4f}".replace(".", "p"),
-            f"noise_{float(demand_noise_override):.4f}".replace(".", "p"),
-        ),
+        route_folder_path=route_folder_path,
     )
 
 

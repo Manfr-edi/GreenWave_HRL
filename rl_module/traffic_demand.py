@@ -8,6 +8,7 @@ colliding with the old deterministic route caches.
 """
 
 import hashlib
+import csv
 import os
 import random
 import re
@@ -37,6 +38,7 @@ WEEKDAY_ALIASES = {
     "sunday": 6,
     "sun": 6,
 }
+_TRAFFIC_DATE_CACHE: dict[str, set[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -45,9 +47,12 @@ class EpisodeDemand:
 
     episode_idx: int
     simulation_date: str
+    day_type: str
     hour: int
     timeslot: str
     timeslot_clean: str
+    hourly_profile_multiplier: float
+    day_type_demand_factor: float
     base_vehicle_count: int
     demand_noise: float
     vehicle_count: int
@@ -103,8 +108,54 @@ def _matches_day_filter(day: datetime, day_filter: str) -> bool:
     )
 
 
+def _normalize_data_date(value: str) -> str | None:
+    """Normalize supported CSV date tokens to the ISO format used by SUMO route generation."""
+
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.split()[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return text
+
+
+def _load_available_traffic_dates(input_file: str = PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH) -> set[str]:
+    """Read the traffic-flow CSV once and return dates that have at least one row."""
+
+    path = os.path.abspath(input_file)
+    cached = _TRAFFIC_DATE_CACHE.get(path)
+    if cached is not None:
+        return cached
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Traffic-flow CSV not found: {path}")
+
+    dates = set()
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter=";")
+        if "data" not in (reader.fieldnames or []):
+            raise ValueError("Traffic-flow CSV must contain a 'data' column.")
+        for row in reader:
+            normalized = _normalize_data_date(row.get("data", ""))
+            if normalized:
+                dates.add(normalized)
+    if not dates:
+        raise ValueError(f"No usable dates found in traffic-flow CSV: {path}")
+    _TRAFFIC_DATE_CACHE[path] = dates
+    return dates
+
+
+def _has_traffic_rows(day: datetime, available_dates: set[str]) -> bool:
+    """Return True only when the requested simulation date exists in the CSV."""
+
+    return day.strftime("%Y-%m-%d") in available_dates
+
+
 def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime, int]]:
-    """Build exactly settings.train_days episodes, optionally shuffled with the fixed seed."""
+    """Build exactly settings.train_days episodes, skipping dates without traffic rows."""
 
     target_episodes = int(settings.train_days)
     if target_episodes <= 0:
@@ -112,20 +163,33 @@ def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime,
     if not settings.focus_hours:
         raise ValueError("focus_hours must contain at least one hour.")
 
+    available_dates = _load_available_traffic_dates()
     episodes = []
     if settings.train_on_same_day:
-        if not _matches_day_filter(settings.start_date, settings.day_filter):
-            raise ValueError("start_date is incompatible with day_filter")
+        day = settings.start_date
+        max_calendar_scan = 366
+        for day_offset in range(max_calendar_scan):
+            candidate = settings.start_date + timedelta(days=day_offset)
+            if _matches_day_filter(candidate, settings.day_filter) and _has_traffic_rows(candidate, available_dates):
+                day = candidate
+                break
+        else:
+            raise ValueError(
+                f"Could not find a valid training day with traffic rows after scanning {max_calendar_scan} days. "
+                "Check start_date, day_filter, and the traffic-flow CSV."
+            )
         for episode_idx in range(target_episodes):
-            episodes.append((settings.start_date, int(settings.focus_hours[episode_idx % len(settings.focus_hours)])))
+            episodes.append((day, int(settings.focus_hours[episode_idx % len(settings.focus_hours)])))
     else:
         # Calendar days are scanned until the requested number of episodes is reached.
         # A matching day contributes one episode per focus hour, capped at target_episodes.
+        # Missing traffic-flow dates are skipped before route generation, so SUMO
+        # never receives a date that cannot produce edge data.
         day_offset = 0
         max_calendar_scan = max(366, target_episodes * 14)
         while len(episodes) < target_episodes and day_offset < max_calendar_scan:
             day = settings.start_date + timedelta(days=day_offset)
-            if _matches_day_filter(day, settings.day_filter):
+            if _matches_day_filter(day, settings.day_filter) and _has_traffic_rows(day, available_dates):
                 for hour in settings.focus_hours:
                     episodes.append((day, int(hour)))
                     if len(episodes) >= target_episodes:
@@ -134,7 +198,7 @@ def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime,
         if len(episodes) < target_episodes:
             raise ValueError(
                 f"Could only build {len(episodes)} episodes after scanning {max_calendar_scan} calendar days. "
-                "Check day_filter and focus_hours."
+                "Check day_filter, focus_hours, and missing dates in the traffic-flow CSV."
             )
 
     if not episodes:
@@ -157,6 +221,37 @@ def sample_demand_noise(settings: DemandSettings, global_seed: int, episode_idx:
     return float(rng.uniform(float(low), float(high)))
 
 
+def _episode_day_type(day: datetime) -> str:
+    """Classify calendar days for demand scaling."""
+
+    return "weekend" if day.weekday() >= 5 else "weekday"
+
+
+def _profile_for_day(day: datetime, demand: DemandSettings) -> dict[int, float]:
+    """Pick the hourly profile used to compute the episode demand baseline."""
+
+    if _episode_day_type(day) == "weekend" and demand.weekend_hourly_profile:
+        return demand.weekend_hourly_profile
+    return demand.hourly_profile
+
+
+def _hourly_profile_multiplier(day: datetime, hour: int, demand: DemandSettings) -> float:
+    """Resolve the hour multiplier, falling back to the standard profile when needed."""
+
+    profile = _profile_for_day(day, demand)
+    if int(hour) in profile:
+        return float(profile[int(hour)])
+    return float(demand.hourly_profile[int(hour)])
+
+
+def _day_type_demand_factor(day: datetime, demand: DemandSettings) -> float:
+    """Apply lower global demand on Saturday/Sunday without changing route seeds."""
+
+    if _episode_day_type(day) == "weekend":
+        return float(demand.weekend_demand_factor)
+    return 1.0
+
+
 def resolve_episode_demand(
     episode_idx: int,
     day: datetime,
@@ -169,9 +264,12 @@ def resolve_episode_demand(
     simulation_date = day.strftime("%Y-%m-%d")
     timeslot = f"{hour:02d}:00-{(hour + 1):02d}:00"
     timeslot_clean = timeslot.replace(":", "-")
-    base_vehicle_count = int(demand.base_demand * demand.hourly_profile[int(hour)])
+    day_type = _episode_day_type(day)
+    hourly_multiplier = _hourly_profile_multiplier(day, int(hour), demand)
+    day_type_factor = _day_type_demand_factor(day, demand)
+    base_vehicle_count = int(demand.base_demand * hourly_multiplier)
     demand_noise = sample_demand_noise(demand, experiment.global_seed, episode_idx, simulation_date, int(hour))
-    vehicle_count = max(1, int(round(base_vehicle_count * demand_noise)))
+    vehicle_count = max(1, int(round(base_vehicle_count * demand_noise * day_type_factor)))
     random_trip_seed = int(demand.random_trip_seed)
     route_sampler_seed = int(demand.route_sampler_seed)
     if demand.vary_route_seeds_by_episode:
@@ -182,8 +280,10 @@ def resolve_episode_demand(
         demand.route_cache_root,
         simulation_date,
         timeslot_clean,
+        day_type,
         vehicle_count,
         demand_noise,
+        day_type_factor,
         experiment.global_seed,
         random_trip_seed,
         route_sampler_seed,
@@ -192,9 +292,12 @@ def resolve_episode_demand(
     return EpisodeDemand(
         episode_idx=int(episode_idx),
         simulation_date=simulation_date,
+        day_type=day_type,
         hour=int(hour),
         timeslot=timeslot,
         timeslot_clean=timeslot_clean,
+        hourly_profile_multiplier=float(hourly_multiplier),
+        day_type_demand_factor=float(day_type_factor),
         base_vehicle_count=int(base_vehicle_count),
         demand_noise=float(demand_noise),
         vehicle_count=int(vehicle_count),
@@ -208,8 +311,10 @@ def build_route_cache_folder(
     root: str,
     simulation_date: str,
     timeslot_clean: str,
+    day_type: str,
     vehicle_count: int,
     demand_noise: float,
+    day_type_demand_factor: float,
     global_seed: int,
     random_trip_seed: int,
     route_sampler_seed: int,
@@ -218,12 +323,15 @@ def build_route_cache_folder(
     """Use explicit path components so route caches document the randomization source."""
 
     noise_tag = f"noise_{float(demand_noise):.4f}".replace(".", "p")
+    day_factor_tag = f"dayfactor_{float(day_type_demand_factor):.4f}".replace(".", "p")
     return os.path.join(
         root,
         simulation_date,
         timeslot_clean,
+        str(day_type),
         f"demand_{int(vehicle_count)}",
         noise_tag,
+        day_factor_tag,
         f"base_seed_{int(global_seed)}",
         f"tripseed_{int(random_trip_seed)}_sampleseed_{int(route_sampler_seed)}_threads_{int(route_sampler_threads)}",
     )

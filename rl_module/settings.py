@@ -67,6 +67,17 @@ class DemandSettings:
         16: 1.3, 17: 1.6, 18: 1.4, 19: 1.0,
         20: 0.8, 21: 0.6, 22: 0.4, 23: 0.3,
     })
+    # Weekend days keep their own configurable demand scale. The hourly profile
+    # can also be overridden when Saturday/Sunday should have shifted peaks.
+    weekend_demand_factor: float = 0.75
+    weekend_hourly_profile: dict[int, float] | None = field(default_factory=lambda: {
+        0: 0.6, 1: 0.4, 2: 0.25, 3: 0.15, 4: 0.15,
+        5: 0.15, 6: 0.25, 7: 0.45, 8: 0.65,
+        9: 0.90, 10: 1.1, 11: 1.20,
+        12: 1.3, 13: 1.1, 14: 0.95, 15: 1.05,
+        16: 1.15, 17: 1.2, 18: 1.2, 19: 1.25,
+        20: 1.1, 21: 0.75, 22: 0.65, 23: 0.65,
+    })
     # Randomness is reproducible: values are sampled from global_seed and episode metadata.
     demand_noise_range: tuple[float, float] = (0.85, 1.15)
     route_cache_root: str = os.path.join(SUMO_PATH, "routes_rl_module_randomized")
