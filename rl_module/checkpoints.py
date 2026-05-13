@@ -10,6 +10,36 @@ import os
 import torch
 
 
+def _finite_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def checkpoint_score_from_baseline(
+    terminal_penalty,
+    baseline_penalty,
+) -> tuple[float | None, str | None, float | None]:
+    """Return the score used to pick the best checkpoint.
+
+    The preferred score is the penalty delta against the no-agent baseline for
+    the same route/hour. This avoids selecting checkpoints only because the
+    current episode had low demand. When no baseline is available, the terminal
+    penalty is kept as a fallback so training can still save a best checkpoint.
+    """
+
+    terminal = _finite_float(terminal_penalty)
+    if terminal is None:
+        return None, None, None
+    baseline = _finite_float(baseline_penalty)
+    if baseline is None:
+        return terminal, "terminal_penalty", None
+    delta = terminal - baseline
+    return delta, "delta_penalty_vs_baseline", delta
+
+
 def load_checkpoint(path: str) -> dict:
     """Load a Torch checkpoint with a clear path error."""
 

@@ -55,8 +55,10 @@ Generated route caches are written under:
 sumoenv/routes_rl_module_randomized/
 ```
 
-Each route path includes the day type, vehicle count, demand-noise tag, weekend
-factor, base seed, and route seeds, so scenarios are explicit and reproducible.
+Each route path keeps date and time slot as folders, then uses one compact
+scenario folder with day type, vehicle count, demand-noise tag, weekend factor,
+base seed, and route seeds, so scenarios are explicit and reproducible without
+deeply nested paths.
 
 ## Usage
 
@@ -112,6 +114,10 @@ The main checkpoint used by later coordinated training is:
 ```text
 rl_module/checkpoints/local_controller/local_controller_best.pt
 ```
+
+The best checkpoint is selected by `delta_penalty_vs_baseline`
+(`rl_penalty - baseline_penalty`) when the no-agent baseline is available, so
+low-demand episodes are not preferred only because their absolute penalty is low.
 
 ### 3. Train The Coordinated Controller
 
@@ -178,10 +184,88 @@ python rl_module/compare_coordinated_controller.py \
   --stochastic-runs 3
 ```
 
+Run validation over a broader calendar set. With `--month`, the script evaluates
+all available traffic-flow dates in that month and uses `settings.py`
+`focus_hours` unless `--timeslot` or `--timeslots` is provided:
+
+```bash
+python rl_module/compare_coordinated_controller.py \
+  --month 2025-10 \
+  --day-filter all \
+  --stochastic-runs 3
+```
+
+Multiple months can be evaluated with `--months`:
+
+```bash
+python rl_module/compare_coordinated_controller.py \
+  --months 2026-01,2026-02 \
+  --day-filter all \
+  --checkpoint-mode by-day-type \
+  --stochastic-runs 3
+```
+
+For 2026 scenarios, route generation automatically uses:
+
+```text
+data/preprocessing/generated/processed_traffic_flow_2026.csv
+```
+
+Other years keep using the default processed traffic-flow file:
+
+```text
+data/preprocessing/generated/processed_traffic_flow.csv
+```
+
+By default, validation uses the same checkpoint for every scenario. To combine
+the separate weekday and weekend trainings in one validation run, use:
+
+```bash
+python rl_module/compare_coordinated_controller.py \
+  --month 2025-10 \
+  --day-filter all \
+  --checkpoint-mode by-day-type \
+  --stochastic-runs 3
+```
+
+In this mode, weekday scenarios use:
+
+```text
+rl_module/saved_trainings/weekdays_7_8/checkpoints/local_controller/local_controller_best.pt
+rl_module/saved_trainings/weekdays_7_8/checkpoints/coordinated_controller/coordinated_controller_best.pt
+```
+
+Weekend scenarios use:
+
+```text
+rl_module/saved_trainings/weekends_7_8/checkpoints/local_controller/local_controller_best.pt
+rl_module/saved_trainings/weekends_7_8/checkpoints/coordinated_controller/coordinated_controller_best.pt
+```
+
+Override those defaults with `--weekday-checkpoint`, `--weekend-checkpoint`,
+`--weekday-local-checkpoint`, and `--weekend-local-checkpoint` when needed.
+
+For explicit slots over a range:
+
+```bash
+python rl_module/compare_coordinated_controller.py \
+  --start-date 2025-10-01 \
+  --end-date 2025-10-31 \
+  --timeslots 07:00-08:00,08:00-09:00 \
+  --stochastic-runs 3
+```
+
 Comparison reports are written under:
 
 ```text
 rl_module/evaluation_reports/coordinated_controller/<date>/<timeslot>/<demand>/
+```
+
+Multi-scenario validation also writes:
+
+```text
+rl_module/evaluation_reports/coordinated_controller/validation/<validation-name>/validation_summary.json
+rl_module/evaluation_reports/coordinated_controller/validation/<validation-name>/validation_summary.csv
 ```
 
 The JSON report includes these sections when the corresponding run is enabled:

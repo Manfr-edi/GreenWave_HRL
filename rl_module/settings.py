@@ -28,8 +28,10 @@ class ExperimentSettings:
     # This is the target number of training episodes, not a calendar-day window.
     train_days: int = 200
     focus_hours: tuple[int, ...] = (7, 8)
+    # focus_hours: tuple[int, ...] = (7, 8)
     # Supported values: all, weekdays, weekends, or explicit weekdays like "mon-wed-sat".
-    day_filter: str = "mon-wed-sat"
+    day_filter: str = "weekends"
+    # day_filter: str = "mon-wed-sat"
     train_on_same_day: bool = False
     shuffle_episode_schedule: bool = False
     global_seed: int = 42
@@ -58,7 +60,7 @@ class ExperimentSettings:
 class DemandSettings:
     """Demand profile and deterministic randomization rules."""
 
-    base_demand: int = 5000
+    base_demand: int = 3000
     hourly_profile: dict[int, float] = field(default_factory=lambda: {
         0: 0.2, 1: 0.15, 2: 0.1, 3: 0.1, 4: 0.2,
         5: 0.4, 6: 0.7, 7: 1.2, 8: 1.5,
@@ -148,7 +150,11 @@ class LocalControllerSettings:
     action_bins: tuple[float, ...] = (-10.0, 0.0, 10.0)
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-4
+    lr_scheduler_factor: float = 0.8
+    lr_scheduler_patience: int = 40
+    lr_scheduler_threshold: float = 0.002
+    min_learning_rate: float = 5e-5
     clip_ratio: float = 0.12
     entropy_coef: float = 0.008
     entropy_coef_final: float = 0.001

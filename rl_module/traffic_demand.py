@@ -16,7 +16,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from libraries.constants import EDGE_DATA_FILE_PATH, PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH
+from libraries.constants import EDGE_DATA_FILE_PATH, PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH, SUMO_OUTPUT_PATH
 from libraries.utils.preprocessingUtils import generateEdgeDataFile
 
 from rl_module.settings import DemandSettings, ExperimentSettings
@@ -39,6 +39,7 @@ WEEKDAY_ALIASES = {
     "sun": 6,
 }
 _TRAFFIC_DATE_CACHE: dict[str, set[str]] = {}
+_PROCESSED_DATA_DIR = os.path.dirname(PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH)
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ class EpisodeDemand:
     random_trip_seed: int
     route_sampler_seed: int
     route_folder_path: str
+    traffic_flow_file_path: str = ""
 
 
 def _stable_int(text: str) -> int:
@@ -123,6 +125,24 @@ def _normalize_data_date(value: str) -> str | None:
     return text
 
 
+def resolve_traffic_flow_file_for_year(year: int) -> str:
+    """Return the processed traffic-flow CSV that should be used for a simulation year."""
+
+    year = int(year)
+    if year == 2026:
+        path = os.path.join(_PROCESSED_DATA_DIR, "processed_traffic_flow_2026.csv")
+        if os.path.exists(path):
+            return path
+        raise FileNotFoundError(f"2026 traffic-flow CSV not found: {path}")
+    return PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH
+
+
+def resolve_traffic_flow_file_for_day(day: datetime) -> str:
+    """Return the processed traffic-flow CSV for the given simulation day."""
+
+    return resolve_traffic_flow_file_for_year(int(day.year))
+
+
 def _load_available_traffic_dates(input_file: str = PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH) -> set[str]:
     """Read the traffic-flow CSV once and return dates that have at least one row."""
 
@@ -148,9 +168,11 @@ def _load_available_traffic_dates(input_file: str = PROCESSED_TRAFFIC_FLOW_EDGE_
     return dates
 
 
-def _has_traffic_rows(day: datetime, available_dates: set[str]) -> bool:
+def _has_traffic_rows(day: datetime, available_dates: set[str] | None = None) -> bool:
     """Return True only when the requested simulation date exists in the CSV."""
 
+    if available_dates is None:
+        available_dates = _load_available_traffic_dates(resolve_traffic_flow_file_for_day(day))
     return day.strftime("%Y-%m-%d") in available_dates
 
 
@@ -163,14 +185,13 @@ def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime,
     if not settings.focus_hours:
         raise ValueError("focus_hours must contain at least one hour.")
 
-    available_dates = _load_available_traffic_dates()
     episodes = []
     if settings.train_on_same_day:
         day = settings.start_date
         max_calendar_scan = 366
         for day_offset in range(max_calendar_scan):
             candidate = settings.start_date + timedelta(days=day_offset)
-            if _matches_day_filter(candidate, settings.day_filter) and _has_traffic_rows(candidate, available_dates):
+            if _matches_day_filter(candidate, settings.day_filter) and _has_traffic_rows(candidate):
                 day = candidate
                 break
         else:
@@ -189,7 +210,7 @@ def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime,
         max_calendar_scan = max(366, target_episodes * 14)
         while len(episodes) < target_episodes and day_offset < max_calendar_scan:
             day = settings.start_date + timedelta(days=day_offset)
-            if _matches_day_filter(day, settings.day_filter) and _has_traffic_rows(day, available_dates):
+            if _matches_day_filter(day, settings.day_filter) and _has_traffic_rows(day):
                 for hour in settings.focus_hours:
                     episodes.append((day, int(hour)))
                     if len(episodes) >= target_episodes:
@@ -289,6 +310,7 @@ def resolve_episode_demand(
         route_sampler_seed,
         demand.route_sampler_threads,
     )
+    traffic_flow_file_path = resolve_traffic_flow_file_for_day(day)
     return EpisodeDemand(
         episode_idx=int(episode_idx),
         simulation_date=simulation_date,
@@ -304,6 +326,7 @@ def resolve_episode_demand(
         random_trip_seed=int(random_trip_seed),
         route_sampler_seed=int(route_sampler_seed),
         route_folder_path=route_folder_path,
+        traffic_flow_file_path=traffic_flow_file_path,
     )
 
 
@@ -320,20 +343,27 @@ def build_route_cache_folder(
     route_sampler_seed: int,
     route_sampler_threads: int,
 ) -> str:
-    """Use explicit path components so route caches document the randomization source."""
+    """Build a compact but unique route-cache path for one demand scenario."""
 
-    noise_tag = f"noise_{float(demand_noise):.4f}".replace(".", "p")
-    day_factor_tag = f"dayfactor_{float(day_type_demand_factor):.4f}".replace(".", "p")
+    noise_tag = f"n{float(demand_noise):.4f}".replace(".", "p")
+    day_factor_tag = f"df{float(day_type_demand_factor):.4f}".replace(".", "p")
+    scenario_tag = "_".join(
+        (
+            str(day_type),
+            f"d{int(vehicle_count)}",
+            noise_tag,
+            day_factor_tag,
+            f"g{int(global_seed)}",
+            f"rt{int(random_trip_seed)}",
+            f"rs{int(route_sampler_seed)}",
+            f"th{int(route_sampler_threads)}",
+        )
+    )
     return os.path.join(
         root,
         simulation_date,
         timeslot_clean,
-        str(day_type),
-        f"demand_{int(vehicle_count)}",
-        noise_tag,
-        day_factor_tag,
-        f"base_seed_{int(global_seed)}",
-        f"tripseed_{int(random_trip_seed)}_sampleseed_{int(route_sampler_seed)}_threads_{int(route_sampler_threads)}",
+        scenario_tag,
     )
 
 
@@ -352,7 +382,10 @@ def ensure_routes(episode: EpisodeDemand, planner, demand: DemandSettings) -> tu
     os.makedirs(os.path.join(episode.route_folder_path, "output"), exist_ok=True)
     if demand.reuse_cached_routes and route_files_ready(episode.route_folder_path):
         return episode.route_folder_path, False
-    generateEdgeDataFile(PROCESSED_TRAFFIC_FLOW_EDGE_FILE_PATH, date=episode.simulation_date, time_slot=episode.timeslot)
+    traffic_flow_file_path = episode.traffic_flow_file_path or resolve_traffic_flow_file_for_year(
+        int(str(episode.simulation_date).split("-", maxsplit=1)[0])
+    )
+    generateEdgeDataFile(traffic_flow_file_path, date=episode.simulation_date, time_slot=episode.timeslot)
     planner.scenarioGenerator.generateRoute(
         inputEdgePath=EDGE_DATA_FILE_PATH,
         timeSlot=episode.timeslot_clean,
@@ -364,3 +397,48 @@ def ensure_routes(episode: EpisodeDemand, planner, demand: DemandSettings) -> tu
         routeSamplerThreads=demand.route_sampler_threads,
     )
     return episode.route_folder_path, True
+
+
+def cleanup_sumo_output_files(*type_paths: str, include_global: bool = True) -> dict:
+    """Delete bulky SUMO output files after metrics have already been parsed.
+
+    Route files are kept intact. For each provided ``type_path`` only the nested
+    ``output`` directory is cleaned; this removes files such as tripinfos,
+    emissions, vehroute, summary, and edge data without touching cached routes.
+    ``include_global`` also removes detector output written under
+    ``sumoenv/output`` by additional detector files.
+    """
+
+    output_dirs = []
+    for type_path in type_paths:
+        if not type_path:
+            continue
+        output_dirs.append(os.path.join(os.path.abspath(type_path), "output"))
+    if include_global:
+        output_dirs.append(os.path.abspath(SUMO_OUTPUT_PATH))
+
+    seen = set()
+    files_removed = 0
+    bytes_removed = 0
+    errors = []
+    for output_dir in output_dirs:
+        if output_dir in seen or not os.path.isdir(output_dir):
+            continue
+        seen.add(output_dir)
+        for root, _, filenames in os.walk(output_dir):
+            for filename in filenames:
+                path = os.path.join(root, filename)
+                try:
+                    size = os.path.getsize(path)
+                    os.remove(path)
+                    files_removed += 1
+                    bytes_removed += int(size)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    errors.append(f"{path}: {exc}")
+    return {
+        "files_removed": int(files_removed),
+        "bytes_removed": int(bytes_removed),
+        "errors": errors,
+    }

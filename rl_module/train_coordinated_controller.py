@@ -22,6 +22,7 @@ from libraries.classes.Planner import Planner
 from libraries.classes.SumoSimulator import Simulator
 from rl_module.checkpoints import (
     append_history,
+    checkpoint_score_from_baseline,
     load_local_controller_weights,
     maybe_resume_coordinated_checkpoint,
     write_history_header,
@@ -49,7 +50,7 @@ from rl_module.ppo import (
     set_global_seed,
 )
 from rl_module.settings import COORDINATOR, DEMAND, ENVIRONMENT, EXPERIMENT, LOCAL_CONTROLLER
-from rl_module.traffic_demand import build_episode_schedule, ensure_routes, resolve_episode_demand
+from rl_module.traffic_demand import cleanup_sumo_output_files, build_episode_schedule, ensure_routes, resolve_episode_demand
 
 
 LOAD_COORDINATED_CHECKPOINT = False
@@ -241,7 +242,13 @@ def main():
     if LOCAL_CONTROLLER.train_local_policy:
         local_optimizer = torch.optim.Adam(local_controller.parameters(), lr=LOCAL_CONTROLLER.learning_rate)
         local_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            local_optimizer, mode="max", factor=0.7, patience=15, threshold=0.005, threshold_mode="rel", min_lr=1e-5
+            local_optimizer,
+            mode="max",
+            factor=LOCAL_CONTROLLER.lr_scheduler_factor,
+            patience=LOCAL_CONTROLLER.lr_scheduler_patience,
+            threshold=LOCAL_CONTROLLER.lr_scheduler_threshold,
+            threshold_mode="rel",
+            min_lr=LOCAL_CONTROLLER.min_learning_rate,
         )
     coordinator_optimizer = torch.optim.Adam(coordinator.parameters(), lr=COORDINATOR.learning_rate)
     coordinator_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -269,7 +276,8 @@ def main():
     csv_cols = [
         "episode", "date", "day_type", "timeslot", "hour", "hourly_profile_multiplier",
         "day_type_demand_factor", "base_vehicle_count", "demand_noise", "vehicle_count",
-        "terminal_penalty", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
+        "terminal_penalty", "baseline_penalty", "delta_penalty_vs_baseline", "checkpoint_score",
+        "checkpoint_score_metric", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
         "coordination_adjustment_mean", "coordinator_reward_mean", "coordinator_price_mean",
         "coordinator_price_std", "spillover_mean", "imbalance_mean", "episode_flow_total",
         "local_ppo_total_loss", "coordinator_ppo_total_loss", "local_learning_rate", "coordinator_learning_rate",
@@ -278,7 +286,11 @@ def main():
     write_history_header(EXPERIMENT.history_csv_path, csv_cols)
     history = []
     baseline_cache = {}
+    best_checkpoint_score = float("inf")
+    best_checkpoint_metric = None
     best_terminal_penalty = float("inf")
+    best_baseline_penalty = None
+    best_delta_penalty_vs_baseline = None
     best_episode = -1
     last_completed_episode = start_episode - 1
     interrupted = False
@@ -314,6 +326,9 @@ def main():
             f"[BASELINE] {'computed' if baseline_ran else 'reused'} | "
             f"parse_ok={bool(baseline_components.get('parse_ok', False))} | penalty={baseline_penalty if baseline_penalty is not None else 'n/a'}"
         )
+        baseline_cleanup = cleanup_sumo_output_files(route_folder_path)
+        if baseline_cleanup["errors"]:
+            print(f"[WARN] SUMO baseline output cleanup errors: {baseline_cleanup['errors'][:3]}")
 
         sumo.changeRouteFilePath(route_folder_path)
         sumo.changeTypePath(route_folder_path)
@@ -469,6 +484,10 @@ def main():
         terminal_components = dict((env.last_reward_components or {}).get("terminal_reward", {}) or {})
         terminal_parse_ok = bool(terminal_components.get("parse_ok", False))
         terminal_penalty = float(terminal_components.get("penalty", 0.0)) if terminal_parse_ok else None
+        checkpoint_score, checkpoint_metric, delta_penalty_vs_baseline = checkpoint_score_from_baseline(
+            terminal_penalty,
+            baseline_penalty,
+        )
         base_local_reward = torch.stack(local_rollout["base_rewards"]).sum(dim=0)
         shaped_local_reward = torch.stack(local_rollout["rewards"]).sum(dim=0)
         coordinator_prices = torch.cat([coordinator.action_values(actions).reshape(-1).detach().cpu() for actions in coordinator_rollout["actions"]])
@@ -484,6 +503,12 @@ def main():
             "demand_noise": float(episode.demand_noise),
             "vehicle_count": int(episode.vehicle_count),
             "terminal_penalty": terminal_penalty if terminal_penalty is not None else "",
+            "baseline_penalty": baseline_penalty if baseline_penalty is not None else "",
+            "delta_penalty_vs_baseline": (
+                delta_penalty_vs_baseline if delta_penalty_vs_baseline is not None else ""
+            ),
+            "checkpoint_score": checkpoint_score if checkpoint_score is not None else "",
+            "checkpoint_score_metric": checkpoint_metric or "",
             "terminal_parse_ok": bool(terminal_parse_ok),
             "base_local_reward_mean": float(base_local_reward.mean().item()),
             "shaped_local_reward_mean": float(shaped_local_reward.mean().item()),
@@ -536,11 +561,23 @@ def main():
             "coordination_reward_config": DEFAULT_REWARD_CONFIG.__dict__,
             "adjacency_metadata": adjacency_metadata,
             "best_episode": int(best_episode),
+            "best_checkpoint_metric": best_checkpoint_metric,
+            "best_checkpoint_score": best_checkpoint_score if math.isfinite(best_checkpoint_score) else None,
             "best_terminal_penalty": best_terminal_penalty if math.isfinite(best_terminal_penalty) else None,
+            "best_baseline_penalty": best_baseline_penalty,
+            "best_delta_penalty_vs_baseline": best_delta_penalty_vs_baseline,
+            "checkpoint_score_metric": checkpoint_metric,
+            "checkpoint_score": checkpoint_score,
+            "baseline_penalty": baseline_penalty,
+            "delta_penalty_vs_baseline": delta_penalty_vs_baseline,
         }
         _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, f"coordinated_controller_episode{episode_idx}.pt"), checkpoint_payload)
-        if terminal_penalty is not None and terminal_penalty < best_terminal_penalty:
-            best_terminal_penalty = float(terminal_penalty)
+        if checkpoint_score is not None and checkpoint_score < best_checkpoint_score:
+            best_checkpoint_score = float(checkpoint_score)
+            best_checkpoint_metric = checkpoint_metric
+            best_terminal_penalty = float(terminal_penalty) if terminal_penalty is not None else float("inf")
+            best_baseline_penalty = baseline_penalty if baseline_penalty is not None else None
+            best_delta_penalty_vs_baseline = delta_penalty_vs_baseline
             best_episode = int(episode_idx)
             best_payload = dict(checkpoint_payload)
             best_payload["local_controller_state_dict"] = local_rollout_state
@@ -550,12 +587,24 @@ def main():
             best_payload["local_scheduler_state_dict"] = None
             best_payload["coordinator_scheduler_state_dict"] = None
             best_payload["best_episode"] = int(best_episode)
-            best_payload["best_terminal_penalty"] = float(best_terminal_penalty)
+            best_payload["best_checkpoint_metric"] = best_checkpoint_metric
+            best_payload["best_checkpoint_score"] = float(best_checkpoint_score)
+            best_payload["best_terminal_penalty"] = (
+                float(best_terminal_penalty) if math.isfinite(best_terminal_penalty) else None
+            )
+            best_payload["best_baseline_penalty"] = best_baseline_penalty
+            best_payload["best_delta_penalty_vs_baseline"] = best_delta_penalty_vs_baseline
             best_payload["policy_stage"] = "pre_update_rollout_policy"
             _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_best.pt"), best_payload)
+        output_cleanup = cleanup_sumo_output_files(route_folder_path)
+        if output_cleanup["errors"]:
+            print(f"[WARN] SUMO output cleanup errors: {output_cleanup['errors'][:3]}")
         last_completed_episode = int(episode_idx)
+        baseline_text = f"{baseline_penalty:.4f}" if baseline_penalty is not None else "n/a"
+        delta_text = f"{delta_penalty_vs_baseline:.4f}" if delta_penalty_vs_baseline is not None else "n/a"
         print(
             f"[RESULT] penalty={terminal_penalty if terminal_penalty is not None else 'n/a'} | "
+            f"baseline={baseline_text} | delta={delta_text} | "
             f"base={row['base_local_reward_mean']:.4f} | shaped={row['shaped_local_reward_mean']:.4f} | "
             f"coord={row['coordinator_reward_mean']:.4f} | price={row['coordinator_price_mean']:.3f} | "
             f"flow={row['episode_flow_total']:.0f}"
@@ -581,7 +630,11 @@ def main():
         "coordination_reward_config": DEFAULT_REWARD_CONFIG.__dict__,
         "adjacency_metadata": adjacency_metadata,
         "best_episode": int(best_episode),
+        "best_checkpoint_metric": best_checkpoint_metric,
+        "best_checkpoint_score": best_checkpoint_score if math.isfinite(best_checkpoint_score) else None,
         "best_terminal_penalty": best_terminal_penalty if math.isfinite(best_terminal_penalty) else None,
+        "best_baseline_penalty": best_baseline_penalty,
+        "best_delta_penalty_vs_baseline": best_delta_penalty_vs_baseline,
         "interrupted": bool(interrupted),
     }
     _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_final.pt"), final_payload)
