@@ -98,3 +98,101 @@ class MultiDiscreteActorCritic(nn.Module):
 
         safe_indices = action_indices.long().clamp(0, self.num_bins - 1)
         return self.action_bins[safe_indices]
+
+
+class PriceAdapterActorCritic(nn.Module):
+    """Local policy with a small trainable price adapter.
+
+    The base local policy consumes the original local observation width. The
+    coordinator price context is mapped to an additive feature residual, so a
+    zero-initialized adapter preserves the pretrained local controller exactly.
+    """
+
+    def __init__(
+        self,
+        base_obs_dim: int,
+        price_context_dim: int,
+        act_dim: int,
+        action_bins: tuple[float, ...],
+        adapter_hidden_dim: int = 64,
+        adapter_scale: float = 0.25,
+    ):
+        super().__init__()
+        self.base_obs_dim = int(base_obs_dim)
+        self.price_context_dim = int(price_context_dim)
+        self.local_obs_dim = self.base_obs_dim + self.price_context_dim
+        self.act_dim = int(act_dim)
+        self.num_bins = int(len(action_bins))
+        self.zero_action_index = int(action_bins.index(0.0))
+        self.adapter_scale = float(adapter_scale)
+        self.base_policy = MultiDiscreteActorCritic(self.base_obs_dim, self.act_dim, action_bins)
+        self.price_adapter = nn.Sequential(
+            nn.LayerNorm(self.price_context_dim),
+            nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(adapter_hidden_dim), 128),
+        )
+        self.register_buffer("action_bins", torch.tensor(action_bins, dtype=torch.float32), persistent=False)
+        self._reset_adapter()
+
+    def _reset_adapter(self):
+        final = self.price_adapter[-1]
+        if isinstance(final, nn.Linear):
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+
+    def load_base_state_dict(self, state_dict: dict):
+        """Load a local-only checkpoint into the frozen base policy."""
+
+        if any(str(key).startswith("base_policy.") for key in state_dict):
+            self.load_state_dict(state_dict)
+            return
+        self.base_policy.load_state_dict(state_dict)
+
+    def configure_trainable(self, train_base_policy: bool, train_price_adapter: bool):
+        for parameter in self.base_policy.parameters():
+            parameter.requires_grad_(bool(train_base_policy))
+        for parameter in self.price_adapter.parameters():
+            parameter.requires_grad_(bool(train_price_adapter))
+
+    def split_observation(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        base_obs = obs[..., : self.base_obs_dim]
+        price_obs = obs[..., self.base_obs_dim : self.base_obs_dim + self.price_context_dim]
+        if price_obs.shape[-1] < self.price_context_dim:
+            pad_width = self.price_context_dim - int(price_obs.shape[-1])
+            price_obs = nn.functional.pad(price_obs, (0, pad_width))
+        return base_obs, price_obs
+
+    def _apply_action_mask(self, logits: torch.Tensor, action_mask: torch.Tensor | None) -> torch.Tensor:
+        return self.base_policy._apply_action_mask(logits, action_mask)
+
+    def forward(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None):
+        base_obs, price_obs = self.split_observation(obs)
+        features = self.base_policy.extractor(base_obs)
+        if self.price_context_dim > 0:
+            features = features + self.adapter_scale * self.price_adapter(price_obs)
+        logits = self.base_policy.logits_head(self.base_policy.actor(features)).reshape(-1, self.act_dim, self.num_bins)
+        value = self.base_policy.critic(features).squeeze(-1)
+        return self._apply_action_mask(logits, action_mask), value
+
+    def act(self, obs: torch.Tensor, action_mask: torch.Tensor, deterministic: bool = False):
+        logits, value = self.forward(obs, action_mask)
+        dist = Categorical(logits=logits)
+        action_index = logits.argmax(dim=-1) if deterministic else dist.sample()
+        valid_mask = action_mask.bool()
+        action_index = torch.where(valid_mask, action_index, torch.full_like(action_index, self.zero_action_index))
+        logp = (dist.log_prob(action_index) * valid_mask.to(dtype=logits.dtype)).sum(dim=-1)
+        return action_index, logp, value
+
+    def evaluate(self, obs: torch.Tensor, actions: torch.Tensor, action_mask: torch.Tensor):
+        logits, value = self.forward(obs, action_mask)
+        dist = Categorical(logits=logits)
+        valid_mask = action_mask.bool()
+        safe_actions = torch.where(valid_mask, actions.long(), torch.full_like(actions.long(), self.zero_action_index))
+        logp = (dist.log_prob(safe_actions) * valid_mask.to(dtype=logits.dtype)).sum(dim=-1)
+        entropy = (dist.entropy() * valid_mask.to(dtype=logits.dtype)).sum(dim=-1)
+        return logp, value, entropy
+
+    def action_values(self, action_indices: torch.Tensor) -> torch.Tensor:
+        safe_indices = action_indices.long().clamp(0, self.num_bins - 1)
+        return self.action_bins[safe_indices]

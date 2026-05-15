@@ -129,7 +129,7 @@ class EnvironmentSettings:
     taz_std_occupancy_ref: float = 0.25
     max_jam_len_ref: float = 120.0
     waiting_time_memory: int = 3600
-    action_signal_threshold: float = 0.0
+    action_signal_threshold: float = 0.03
     sumo_thread_rngs: int = 1
     coordination_distance: float = 350.0
     coordination_path_length: float = 900.0
@@ -166,7 +166,10 @@ class LocalControllerSettings:
     minibatch_size: int = 64
     load_pretrained: bool = True
     pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "checkpoints", "local_controller", "local_controller_best.pt")
-    train_local_policy: bool = True
+    # In the coordinated stage the pretrained local policy should remain the
+    # behavioral reference. The coordinator learns through a small price adapter.
+    train_local_policy: bool = False
+    train_price_adapter: bool = True
 
 
 @dataclass(frozen=True)
@@ -187,6 +190,9 @@ class CoordinatorSettings:
     minibatch_size: int = 32
     gamma: float = 0.99
     gae_lambda: float = 0.95
+    coordination_reference_mode: str = "local_only"
+    price_adapter_hidden_dim: int = 64
+    price_adapter_scale: float = 0.25
 
 
 EXPERIMENT = ExperimentSettings()

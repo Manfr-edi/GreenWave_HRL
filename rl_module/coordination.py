@@ -368,7 +368,7 @@ def compute_coordination_step_rewards(
     city_delta = float(delta_penalties.sum().item())
     if baseline_penalty is not None and terminal_penalty is not None:
         city_term = float(baseline_penalty - terminal_penalty)
-        city_reward_basis = "baseline_terminal_delta"
+        city_reward_basis = "reference_terminal_delta"
     else:
         city_term = city_delta
         city_reward_basis = "step_penalty_delta"
@@ -405,4 +405,3 @@ def compute_coordination_step_rewards(
         "inflow_by_taz": {taz_id: float(flow[:, idx].sum().item()) for idx, taz_id in enumerate(taz_ids)},
     }
     return local_adjustment, float(global_reward), diagnostics
-

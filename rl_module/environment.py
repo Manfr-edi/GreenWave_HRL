@@ -1530,7 +1530,7 @@ class LocalTazTrafficEnv(EnvBase):
 
         components = {
             "parse_ok": True,
-            "reward_basis": "baseline_waiting_emission_jam_delta" if use_comparison else "absolute_waiting_emission_jam_penalty",
+            "reward_basis": "reference_waiting_emission_jam_delta" if use_comparison else "absolute_waiting_emission_jam_penalty",
             "trip_count": int(waiting["vehicle_count"]),
             "avg_waiting_time": float(waiting["avg_waiting_time"]),
             "total_waiting_time": float(waiting["total_waiting_time"]),
@@ -1547,6 +1547,7 @@ class LocalTazTrafficEnv(EnvBase):
             "jam_penalty": float(jam_penalty),
             "penalty": float(penalty),
             "baseline_penalty": float(baseline_penalty),
+            "reference_penalty": float(baseline_penalty),
             "delta_penalty": float(baseline_penalty - penalty) if use_comparison else 0.0,
             "reward_raw": float(reward_raw),
             "total": float(reward),

@@ -18,26 +18,40 @@ def _finite_float(value) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-def checkpoint_score_from_baseline(
+def checkpoint_score_from_reference(
     terminal_penalty,
-    baseline_penalty,
+    reference_penalty,
+    metric_name: str = "delta_penalty_vs_reference",
 ) -> tuple[float | None, str | None, float | None]:
-    """Return the score used to pick the best checkpoint.
+    """Return the score used to pick the best checkpoint against a reference.
 
-    The preferred score is the penalty delta against the no-agent baseline for
-    the same route/hour. This avoids selecting checkpoints only because the
-    current episode had low demand. When no baseline is available, the terminal
-    penalty is kept as a fallback so training can still save a best checkpoint.
+    The preferred score is the penalty delta against a reference run for the
+    same route/hour. This avoids selecting checkpoints only because the current
+    episode had low demand. When no reference is available, the terminal penalty
+    is kept as a fallback so training can still save a best checkpoint.
     """
 
     terminal = _finite_float(terminal_penalty)
     if terminal is None:
         return None, None, None
-    baseline = _finite_float(baseline_penalty)
-    if baseline is None:
+    reference = _finite_float(reference_penalty)
+    if reference is None:
         return terminal, "terminal_penalty", None
-    delta = terminal - baseline
-    return delta, "delta_penalty_vs_baseline", delta
+    delta = terminal - reference
+    return delta, str(metric_name), delta
+
+
+def checkpoint_score_from_baseline(
+    terminal_penalty,
+    baseline_penalty,
+) -> tuple[float | None, str | None, float | None]:
+    """Compatibility wrapper for no-agent baseline checkpoint scoring."""
+
+    return checkpoint_score_from_reference(
+        terminal_penalty,
+        baseline_penalty,
+        metric_name="delta_penalty_vs_baseline",
+    )
 
 
 def load_checkpoint(path: str) -> dict:
@@ -56,6 +70,9 @@ def load_local_controller_weights(policy, checkpoint_path: str, base_obs_dim: in
         "local_controller_state_dict",
         checkpoint.get("model_state_dict", checkpoint.get("local_model_state_dict", checkpoint)),
     )
+    if hasattr(policy, "load_base_state_dict"):
+        policy.load_base_state_dict(source)
+        return
     target = policy.state_dict()
     patched = {}
     for key, target_tensor in target.items():

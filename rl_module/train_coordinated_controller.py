@@ -23,6 +23,7 @@ from libraries.classes.SumoSimulator import Simulator
 from rl_module.checkpoints import (
     append_history,
     checkpoint_score_from_baseline,
+    checkpoint_score_from_reference,
     load_local_controller_weights,
     maybe_resume_coordinated_checkpoint,
     write_history_header,
@@ -39,7 +40,7 @@ from rl_module.coordination import (
     summarize_step_actions,
 )
 from rl_module.environment import CoordinatedTazTrafficEnv
-from rl_module.policy import MultiDiscreteActorCritic
+from rl_module.policy import MultiDiscreteActorCritic, PriceAdapterActorCritic
 from rl_module.ppo import (
     clone_state_dict_to_cpu,
     compute_gae,
@@ -59,16 +60,16 @@ RESUME_FROM_CHECKPOINT_EPISODE = True
 START_EPISODE_OVERRIDE = None
 
 
-def _global_context_tensor(episode, baseline_penalty: float | None, device: torch.device) -> torch.Tensor:
+def _global_context_tensor(episode, reference_penalty: float | None, device: torch.device) -> torch.Tensor:
     """Compact episode context consumed by the coordinator."""
 
-    baseline_value = 0.0 if baseline_penalty is None else float(np.clip(float(baseline_penalty), -5.0, 5.0))
+    reference_value = 0.0 if reference_penalty is None else float(np.clip(float(reference_penalty), -5.0, 5.0))
     return torch.tensor(
         [
             float(episode.hour) / 23.0,
             float(episode.vehicle_count) / max(float(DEMAND.base_demand), 1.0),
             float(episode.demand_noise),
-            baseline_value,
+            reference_value,
         ],
         dtype=torch.float32,
         device=device,
@@ -109,6 +110,74 @@ def _ensure_baseline_reference(env, sumo, hour: int, route_folder_path: str, cac
     if not bool(components.get("parse_ok", False)):
         penalty = None
     cache[key] = (penalty, dict(components))
+    return penalty, dict(components), True
+
+
+def _run_local_reference_episode(
+    env,
+    sumo,
+    local_reference_policy,
+    hour: int,
+    route_folder_path: str,
+    device: torch.device,
+    deterministic: bool = True,
+) -> tuple[float | None, dict]:
+    """Run the frozen local-only controller on the same route/hour."""
+
+    was_training = bool(local_reference_policy.training)
+    local_reference_policy.eval()
+    sumo.changeRouteFilePath(route_folder_path)
+    sumo.changeTypePath(route_folder_path)
+    env.set_baseline_penalty(None)
+    env.set_episode_context(hour=hour)
+    td = env.reset()
+
+    with torch.no_grad():
+        while True:
+            local_obs = td["observation"]
+            action_mask = td["action_mask"].bool()
+            action_index, _, _ = local_reference_policy.act(local_obs, action_mask, deterministic=deterministic)
+            step_td = env.step(TensorDict({"action": action_index}, batch_size=[], device=device))
+            next_td = step_td["next"] if "next" in step_td.keys() else step_td
+            terminated = bool(next_td["terminated"].item())
+            truncated = bool(next_td["truncated"].item())
+            if terminated or truncated:
+                break
+            td = next_td
+
+    terminal_components = dict((env.last_reward_components or {}).get("terminal_reward", {}) or {})
+    penalty = float(terminal_components.get("penalty", 0.0)) if bool(terminal_components.get("parse_ok", False)) else None
+    local_reference_policy.train(mode=was_training)
+    return penalty, terminal_components
+
+
+def _ensure_local_reference(
+    env,
+    sumo,
+    local_reference_policy,
+    hour: int,
+    route_folder_path: str,
+    device: torch.device,
+    cache: dict,
+    cache_enabled: bool,
+) -> tuple[float | None, dict, bool]:
+    """Run or reuse the local-only reference for a specific route folder."""
+
+    key = (route_folder_path, int(hour))
+    if cache_enabled and key in cache:
+        penalty, components = cache[key]
+        return penalty, dict(components), False
+    penalty, components = _run_local_reference_episode(
+        env=env,
+        sumo=sumo,
+        local_reference_policy=local_reference_policy,
+        hour=hour,
+        route_folder_path=route_folder_path,
+        device=device,
+        deterministic=True,
+    )
+    if cache_enabled:
+        cache[key] = (penalty, dict(components))
     return penalty, dict(components), True
 
 
@@ -221,26 +290,45 @@ def main():
     )
     coordinator_obs_dim = _build_coordinator_obs_dim(env, adjacency_matrix, device)
 
-    local_controller = MultiDiscreteActorCritic(augmented_obs_dim, local_act_dim, LOCAL_CONTROLLER.action_bins).to(device)
+    local_controller = PriceAdapterActorCritic(
+        base_obs_dim=base_obs_dim,
+        price_context_dim=COORDINATOR.local_price_context_dim,
+        act_dim=local_act_dim,
+        action_bins=LOCAL_CONTROLLER.action_bins,
+        adapter_hidden_dim=COORDINATOR.price_adapter_hidden_dim,
+        adapter_scale=COORDINATOR.price_adapter_scale,
+    ).to(device)
+    local_reference_controller = MultiDiscreteActorCritic(base_obs_dim, local_act_dim, LOCAL_CONTROLLER.action_bins).to(device)
     if LOCAL_CONTROLLER.load_pretrained:
         # The coordinated stage is normally initialized from the local-only
         # checkpoint. If it is missing, training still works from random weights.
         if os.path.exists(LOCAL_CONTROLLER.pretrained_checkpoint_path):
             load_local_controller_weights(local_controller, LOCAL_CONTROLLER.pretrained_checkpoint_path, base_obs_dim=base_obs_dim)
+            load_local_controller_weights(local_reference_controller, LOCAL_CONTROLLER.pretrained_checkpoint_path, base_obs_dim=base_obs_dim)
         else:
             print(f"[WARN] Local pretraining checkpoint not found: {LOCAL_CONTROLLER.pretrained_checkpoint_path}")
             print("[WARN] Starting coordinated local controller from random weights.")
-    local_controller.train(mode=LOCAL_CONTROLLER.train_local_policy)
-    if not LOCAL_CONTROLLER.train_local_policy:
-        for parameter in local_controller.parameters():
-            parameter.requires_grad_(False)
+            local_reference_controller.load_state_dict(local_controller.base_policy.state_dict())
+    else:
+        local_reference_controller.load_state_dict(local_controller.base_policy.state_dict())
+    local_reference_controller.eval()
+    for parameter in local_reference_controller.parameters():
+        parameter.requires_grad_(False)
+
+    local_trainable = bool(LOCAL_CONTROLLER.train_local_policy or LOCAL_CONTROLLER.train_price_adapter)
+    local_controller.configure_trainable(
+        train_base_policy=LOCAL_CONTROLLER.train_local_policy,
+        train_price_adapter=LOCAL_CONTROLLER.train_price_adapter,
+    )
+    local_controller.train(mode=local_trainable)
 
     coordinator = MultiDiscreteActorCritic(coordinator_obs_dim, num_taz, COORDINATOR.price_bins).to(device)
     coordinator.train()
     local_optimizer = None
     local_scheduler = None
-    if LOCAL_CONTROLLER.train_local_policy:
-        local_optimizer = torch.optim.Adam(local_controller.parameters(), lr=LOCAL_CONTROLLER.learning_rate)
+    local_trainable_parameters = [parameter for parameter in local_controller.parameters() if parameter.requires_grad]
+    if local_trainable_parameters:
+        local_optimizer = torch.optim.Adam(local_trainable_parameters, lr=LOCAL_CONTROLLER.learning_rate)
         local_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             local_optimizer,
             mode="max",
@@ -276,8 +364,10 @@ def main():
     csv_cols = [
         "episode", "date", "day_type", "timeslot", "hour", "hourly_profile_multiplier",
         "day_type_demand_factor", "base_vehicle_count", "demand_noise", "vehicle_count",
-        "terminal_penalty", "baseline_penalty", "delta_penalty_vs_baseline", "checkpoint_score",
-        "checkpoint_score_metric", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
+        "terminal_penalty", "baseline_penalty", "delta_penalty_vs_baseline", "local_reference_penalty",
+        "delta_penalty_vs_local_reference", "coordination_reference_mode", "coordination_reference_label",
+        "coordination_reference_penalty",
+        "checkpoint_score", "checkpoint_score_metric", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
         "coordination_adjustment_mean", "coordinator_reward_mean", "coordinator_price_mean",
         "coordinator_price_std", "spillover_mean", "imbalance_mean", "episode_flow_total",
         "local_ppo_total_loss", "coordinator_ppo_total_loss", "local_learning_rate", "coordinator_learning_rate",
@@ -286,11 +376,14 @@ def main():
     write_history_header(EXPERIMENT.history_csv_path, csv_cols)
     history = []
     baseline_cache = {}
+    local_reference_cache = {}
     best_checkpoint_score = float("inf")
     best_checkpoint_metric = None
     best_terminal_penalty = float("inf")
     best_baseline_penalty = None
+    best_local_reference_penalty = None
     best_delta_penalty_vs_baseline = None
+    best_delta_penalty_vs_local_reference = None
     best_episode = -1
     last_completed_episode = start_episode - 1
     interrupted = False
@@ -298,6 +391,11 @@ def main():
     print(
         f"[INFO] coordinated_controller | episodes={total_episodes} | taz={num_taz} | "
         f"base_obs={base_obs_dim} | augmented_obs={augmented_obs_dim} | coordinator_obs={coordinator_obs_dim}"
+    )
+    print(
+        f"[INFO] coordination_reference_mode={COORDINATOR.coordination_reference_mode} | "
+        f"train_local_policy={LOCAL_CONTROLLER.train_local_policy} | "
+        f"train_price_adapter={LOCAL_CONTROLLER.train_price_adapter}"
     )
     print(f"[INFO] demand_noise_range={DEMAND.demand_noise_range} | schedule_shuffle={EXPERIMENT.shuffle_episode_schedule}")
     print(f"[INFO] route_cache_root={DEMAND.route_cache_root}")
@@ -330,10 +428,35 @@ def main():
         if baseline_cleanup["errors"]:
             print(f"[WARN] SUMO baseline output cleanup errors: {baseline_cleanup['errors'][:3]}")
 
+        local_reference_penalty, local_reference_components, local_reference_ran = _ensure_local_reference(
+            env=env,
+            sumo=sumo,
+            local_reference_policy=local_reference_controller,
+            hour=episode.hour,
+            route_folder_path=route_folder_path,
+            device=device,
+            cache=local_reference_cache,
+            cache_enabled=not bool(LOCAL_CONTROLLER.train_local_policy),
+        )
+        print(
+            f"[LOCAL REF] {'computed' if local_reference_ran else 'reused'} | "
+            f"parse_ok={bool(local_reference_components.get('parse_ok', False))} | "
+            f"penalty={local_reference_penalty if local_reference_penalty is not None else 'n/a'}"
+        )
+        local_reference_cleanup = cleanup_sumo_output_files(route_folder_path)
+        if local_reference_cleanup["errors"]:
+            print(f"[WARN] SUMO local-reference output cleanup errors: {local_reference_cleanup['errors'][:3]}")
+
+        coordination_reference_mode = str(COORDINATOR.coordination_reference_mode)
+        use_local_reference = coordination_reference_mode == "local_only" and local_reference_penalty is not None
+        coordination_reference_penalty = local_reference_penalty if use_local_reference else baseline_penalty
+        coordination_reference_components = local_reference_components if use_local_reference else baseline_components
+        coordination_reference_label = "local_reference" if use_local_reference else "baseline"
+
         sumo.changeRouteFilePath(route_folder_path)
         sumo.changeTypePath(route_folder_path)
-        if ENVIRONMENT.comparison_reward_enabled and baseline_penalty is not None:
-            env.set_baseline_penalty(baseline_penalty, baseline_components)
+        if ENVIRONMENT.comparison_reward_enabled and coordination_reference_penalty is not None:
+            env.set_baseline_penalty(coordination_reference_penalty, coordination_reference_components)
         else:
             env.set_baseline_penalty(None)
         env.set_episode_context(hour=episode.hour)
@@ -362,7 +485,7 @@ def main():
                 previous_prices=previous_prices,
                 previous_action_summary=previous_action_summary,
                 taz_ids=taz_ids,
-                extra_context=_global_context_tensor(episode, baseline_penalty, device),
+                extra_context=_global_context_tensor(episode, coordination_reference_penalty, device),
                 config=DEFAULT_OBSERVATION_CONFIG,
             )
             coordinator_action_mask = torch.ones((1, num_taz), dtype=torch.bool, device=device)
@@ -399,12 +522,12 @@ def main():
                 reward_components=reward_components,
                 flow_matrix=flow_matrix,
                 action_summary_by_taz=current_action_summary,
-                baseline_penalty=baseline_penalty if done_value > 0.0 else None,
+                baseline_penalty=coordination_reference_penalty if done_value > 0.0 else None,
                 terminal_penalty=terminal_penalty if done_value > 0.0 else None,
                 config=DEFAULT_REWARD_CONFIG,
             )
             shaped_reward_vec = base_reward_vec
-            if LOCAL_CONTROLLER.train_local_policy:
+            if local_optimizer is not None:
                 shaped_reward_vec = shaped_reward_vec + local_adjustment.to(device=device, dtype=base_reward_vec.dtype)
 
             local_rollout["obs"].append(augmented_local_obs.detach().clone())
@@ -438,7 +561,7 @@ def main():
 
         local_stats = {"total_loss": "", "policy_loss": "", "value_loss": "", "clip_fraction": "", "approx_kl": "", "entropy_mean": ""}
         local_lr = ""
-        if LOCAL_CONTROLLER.train_local_policy:
+        if local_optimizer is not None:
             local_rewards_t = torch.stack(local_rollout["rewards"])
             local_values_t = torch.stack(local_rollout["values"])
             local_dones_t = torch.stack(local_rollout["dones"])
@@ -484,9 +607,22 @@ def main():
         terminal_components = dict((env.last_reward_components or {}).get("terminal_reward", {}) or {})
         terminal_parse_ok = bool(terminal_components.get("parse_ok", False))
         terminal_penalty = float(terminal_components.get("penalty", 0.0)) if terminal_parse_ok else None
-        checkpoint_score, checkpoint_metric, delta_penalty_vs_baseline = checkpoint_score_from_baseline(
+        _, _, delta_penalty_vs_baseline = checkpoint_score_from_baseline(
             terminal_penalty,
             baseline_penalty,
+        )
+        delta_penalty_vs_local_reference = None
+        if terminal_penalty is not None and local_reference_penalty is not None:
+            delta_penalty_vs_local_reference = float(terminal_penalty - local_reference_penalty)
+        checkpoint_metric_name = (
+            "delta_penalty_vs_local_reference"
+            if coordination_reference_label == "local_reference"
+            else "delta_penalty_vs_baseline"
+        )
+        checkpoint_score, checkpoint_metric, _ = checkpoint_score_from_reference(
+            terminal_penalty,
+            coordination_reference_penalty,
+            metric_name=checkpoint_metric_name,
         )
         base_local_reward = torch.stack(local_rollout["base_rewards"]).sum(dim=0)
         shaped_local_reward = torch.stack(local_rollout["rewards"]).sum(dim=0)
@@ -506,6 +642,15 @@ def main():
             "baseline_penalty": baseline_penalty if baseline_penalty is not None else "",
             "delta_penalty_vs_baseline": (
                 delta_penalty_vs_baseline if delta_penalty_vs_baseline is not None else ""
+            ),
+            "local_reference_penalty": local_reference_penalty if local_reference_penalty is not None else "",
+            "delta_penalty_vs_local_reference": (
+                delta_penalty_vs_local_reference if delta_penalty_vs_local_reference is not None else ""
+            ),
+            "coordination_reference_mode": str(COORDINATOR.coordination_reference_mode),
+            "coordination_reference_label": coordination_reference_label,
+            "coordination_reference_penalty": (
+                coordination_reference_penalty if coordination_reference_penalty is not None else ""
             ),
             "checkpoint_score": checkpoint_score if checkpoint_score is not None else "",
             "checkpoint_score_metric": checkpoint_metric or "",
@@ -533,6 +678,10 @@ def main():
             "episode": int(episode_idx),
             "episode_demand": episode.__dict__,
             "baseline_components": baseline_components,
+            "local_reference_components": local_reference_components,
+            "coordination_reference_mode": str(COORDINATOR.coordination_reference_mode),
+            "coordination_reference_label": coordination_reference_label,
+            "coordination_reference_penalty": coordination_reference_penalty,
             "terminal_reward": terminal_components,
             "coordination_step_diagnostics": step_diagnostics,
             "flow_diagnostics": env.get_coordination_flow_diagnostics(),
@@ -543,6 +692,9 @@ def main():
 
         checkpoint_payload = {
             "architecture_name": "coordinated_controller",
+            "local_policy_class": "PriceAdapterActorCritic",
+            "coordination_reference_mode": str(COORDINATOR.coordination_reference_mode),
+            "coordination_reference_label": coordination_reference_label,
             "episode": int(episode_idx),
             "local_controller_state_dict": local_controller.state_dict(),
             "coordinator_state_dict": coordinator.state_dict(),
@@ -565,11 +717,16 @@ def main():
             "best_checkpoint_score": best_checkpoint_score if math.isfinite(best_checkpoint_score) else None,
             "best_terminal_penalty": best_terminal_penalty if math.isfinite(best_terminal_penalty) else None,
             "best_baseline_penalty": best_baseline_penalty,
+            "best_local_reference_penalty": best_local_reference_penalty,
             "best_delta_penalty_vs_baseline": best_delta_penalty_vs_baseline,
+            "best_delta_penalty_vs_local_reference": best_delta_penalty_vs_local_reference,
             "checkpoint_score_metric": checkpoint_metric,
             "checkpoint_score": checkpoint_score,
             "baseline_penalty": baseline_penalty,
             "delta_penalty_vs_baseline": delta_penalty_vs_baseline,
+            "local_reference_penalty": local_reference_penalty,
+            "delta_penalty_vs_local_reference": delta_penalty_vs_local_reference,
+            "coordination_reference_penalty": coordination_reference_penalty,
         }
         _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, f"coordinated_controller_episode{episode_idx}.pt"), checkpoint_payload)
         if checkpoint_score is not None and checkpoint_score < best_checkpoint_score:
@@ -577,7 +734,9 @@ def main():
             best_checkpoint_metric = checkpoint_metric
             best_terminal_penalty = float(terminal_penalty) if terminal_penalty is not None else float("inf")
             best_baseline_penalty = baseline_penalty if baseline_penalty is not None else None
+            best_local_reference_penalty = local_reference_penalty if local_reference_penalty is not None else None
             best_delta_penalty_vs_baseline = delta_penalty_vs_baseline
+            best_delta_penalty_vs_local_reference = delta_penalty_vs_local_reference
             best_episode = int(episode_idx)
             best_payload = dict(checkpoint_payload)
             best_payload["local_controller_state_dict"] = local_rollout_state
@@ -593,7 +752,9 @@ def main():
                 float(best_terminal_penalty) if math.isfinite(best_terminal_penalty) else None
             )
             best_payload["best_baseline_penalty"] = best_baseline_penalty
+            best_payload["best_local_reference_penalty"] = best_local_reference_penalty
             best_payload["best_delta_penalty_vs_baseline"] = best_delta_penalty_vs_baseline
+            best_payload["best_delta_penalty_vs_local_reference"] = best_delta_penalty_vs_local_reference
             best_payload["policy_stage"] = "pre_update_rollout_policy"
             _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_best.pt"), best_payload)
         output_cleanup = cleanup_sumo_output_files(route_folder_path)
@@ -601,10 +762,17 @@ def main():
             print(f"[WARN] SUMO output cleanup errors: {output_cleanup['errors'][:3]}")
         last_completed_episode = int(episode_idx)
         baseline_text = f"{baseline_penalty:.4f}" if baseline_penalty is not None else "n/a"
-        delta_text = f"{delta_penalty_vs_baseline:.4f}" if delta_penalty_vs_baseline is not None else "n/a"
+        local_ref_text = f"{local_reference_penalty:.4f}" if local_reference_penalty is not None else "n/a"
+        delta_baseline_text = f"{delta_penalty_vs_baseline:.4f}" if delta_penalty_vs_baseline is not None else "n/a"
+        delta_local_text = (
+            f"{delta_penalty_vs_local_reference:.4f}"
+            if delta_penalty_vs_local_reference is not None
+            else "n/a"
+        )
         print(
             f"[RESULT] penalty={terminal_penalty if terminal_penalty is not None else 'n/a'} | "
-            f"baseline={baseline_text} | delta={delta_text} | "
+            f"baseline={baseline_text} | delta_base={delta_baseline_text} | "
+            f"local_ref={local_ref_text} | delta_local={delta_local_text} | "
             f"base={row['base_local_reward_mean']:.4f} | shaped={row['shaped_local_reward_mean']:.4f} | "
             f"coord={row['coordinator_reward_mean']:.4f} | price={row['coordinator_price_mean']:.3f} | "
             f"flow={row['episode_flow_total']:.0f}"
@@ -612,6 +780,8 @@ def main():
 
     final_payload = {
         "architecture_name": "coordinated_controller",
+        "local_policy_class": "PriceAdapterActorCritic",
+        "coordination_reference_mode": str(COORDINATOR.coordination_reference_mode),
         "episode": int(last_completed_episode),
         "local_controller_state_dict": local_controller.state_dict(),
         "coordinator_state_dict": coordinator.state_dict(),
@@ -634,7 +804,9 @@ def main():
         "best_checkpoint_score": best_checkpoint_score if math.isfinite(best_checkpoint_score) else None,
         "best_terminal_penalty": best_terminal_penalty if math.isfinite(best_terminal_penalty) else None,
         "best_baseline_penalty": best_baseline_penalty,
+        "best_local_reference_penalty": best_local_reference_penalty,
         "best_delta_penalty_vs_baseline": best_delta_penalty_vs_baseline,
+        "best_delta_penalty_vs_local_reference": best_delta_penalty_vs_local_reference,
         "interrupted": bool(interrupted),
     }
     _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_final.pt"), final_payload)

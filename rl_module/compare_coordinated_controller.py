@@ -55,7 +55,7 @@ from rl_module.coordination import (
     summarize_step_actions,
 )
 from rl_module.environment import CoordinatedTazTrafficEnv
-from rl_module.policy import MultiDiscreteActorCritic
+from rl_module.policy import MultiDiscreteActorCritic, PriceAdapterActorCritic
 from rl_module.settings import COORDINATOR, DEMAND, ENVIRONMENT, EXPERIMENT, LOCAL_CONTROLLER, PACKAGE_DIR
 from rl_module.traffic_demand import (
     EpisodeDemand,
@@ -491,14 +491,14 @@ def _evaluation_episode(simulation_date: str, hour: int, episode_index: int, dem
     )
 
 
-def _global_context_tensor(episode: EpisodeDemand, baseline_penalty: float | None, device: torch.device) -> torch.Tensor:
-    baseline_value = 0.0 if baseline_penalty is None else float(np.clip(float(baseline_penalty), -5.0, 5.0))
+def _global_context_tensor(episode: EpisodeDemand, reference_penalty: float | None, device: torch.device) -> torch.Tensor:
+    reference_value = 0.0 if reference_penalty is None else float(np.clip(float(reference_penalty), -5.0, 5.0))
     return torch.tensor(
         [
             float(episode.hour) / 23.0,
             float(episode.vehicle_count) / max(float(DEMAND.base_demand), 1.0),
             float(episode.demand_noise),
-            baseline_value,
+            reference_value,
         ],
         dtype=torch.float32,
         device=device,
@@ -528,8 +528,22 @@ def _build_policy_bundle(checkpoint: dict, env: CoordinatedTazTrafficEnv, adjace
             config=obs_config,
         ).shape[-1]
     )
-    local_obs_dim = int(checkpoint.get("augmented_obs_dim", env.agent_obs_dim + COORDINATOR.local_price_context_dim))
-    local_policy = MultiDiscreteActorCritic(local_obs_dim, env.max_control_groups_per_taz, local_action_bins).to(device)
+    coordinator_settings = dict(checkpoint.get("coordinator_settings", {}) or {})
+    local_policy_class = str(checkpoint.get("local_policy_class", "MultiDiscreteActorCritic"))
+    base_obs_dim = int(checkpoint.get("base_obs_dim", env.agent_obs_dim))
+    price_context_dim = int(coordinator_settings.get("local_price_context_dim", COORDINATOR.local_price_context_dim))
+    local_obs_dim = int(checkpoint.get("augmented_obs_dim", base_obs_dim + price_context_dim))
+    if local_policy_class == "PriceAdapterActorCritic":
+        local_policy = PriceAdapterActorCritic(
+            base_obs_dim=base_obs_dim,
+            price_context_dim=price_context_dim,
+            act_dim=env.max_control_groups_per_taz,
+            action_bins=local_action_bins,
+            adapter_hidden_dim=int(coordinator_settings.get("price_adapter_hidden_dim", COORDINATOR.price_adapter_hidden_dim)),
+            adapter_scale=float(coordinator_settings.get("price_adapter_scale", COORDINATOR.price_adapter_scale)),
+        ).to(device)
+    else:
+        local_policy = MultiDiscreteActorCritic(local_obs_dim, env.max_control_groups_per_taz, local_action_bins).to(device)
     coordinator = MultiDiscreteActorCritic(coordinator_obs_dim, num_taz, price_bins).to(device)
     local_state = checkpoint.get("local_controller_state_dict", checkpoint.get("local_model_state_dict"))
     coordinator_state = checkpoint.get("coordinator_state_dict", checkpoint.get("global_model_state_dict"))
@@ -546,6 +560,8 @@ def _build_policy_bundle(checkpoint: dict, env: CoordinatedTazTrafficEnv, adjace
         "reward_config": reward_config,
         "price_bins": price_bins,
         "local_action_bins": local_action_bins,
+        "local_policy_class": local_policy_class,
+        "coordination_reference_mode": str(checkpoint.get("coordination_reference_mode", "no_agent_baseline")),
         "coordinator_obs_dim": int(coordinator_obs_dim),
         "local_obs_dim": int(local_obs_dim),
     }
@@ -635,7 +651,14 @@ def _run_local_episode(env, bundle: dict, episode: EpisodeDemand, deterministic:
     }
 
 
-def _run_rl_episode(env, bundle: dict, adjacency_matrix: torch.Tensor, episode: EpisodeDemand, deterministic: bool, baseline_penalty: float | None) -> dict:
+def _run_rl_episode(
+    env,
+    bundle: dict,
+    adjacency_matrix: torch.Tensor,
+    episode: EpisodeDemand,
+    deterministic: bool,
+    reference_penalty: float | None,
+) -> dict:
     device = torch.device(env.device)
     taz_ids = env.get_taz_ids()
     num_taz = len(taz_ids)
@@ -645,7 +668,10 @@ def _run_rl_episode(env, bundle: dict, adjacency_matrix: torch.Tensor, episode: 
     step_prices = []
     step_diagnostics = []
     step_flows = []
-    env.set_baseline_penalty(None)
+    if reference_penalty is not None:
+        env.set_baseline_penalty(reference_penalty)
+    else:
+        env.set_baseline_penalty(None)
     env.set_episode_context(hour=episode.hour)
     td = env.reset()
 
@@ -660,7 +686,7 @@ def _run_rl_episode(env, bundle: dict, adjacency_matrix: torch.Tensor, episode: 
                 previous_prices=previous_prices,
                 previous_action_summary=previous_action_summary,
                 taz_ids=taz_ids,
-                extra_context=_global_context_tensor(episode, baseline_penalty, device),
+                extra_context=_global_context_tensor(episode, reference_penalty, device),
                 config=bundle["observation_config"],
             )
             coordinator_action_mask = torch.ones((1, num_taz), dtype=torch.bool, device=device)
@@ -689,7 +715,7 @@ def _run_rl_episode(env, bundle: dict, adjacency_matrix: torch.Tensor, episode: 
                 reward_components=reward_components,
                 flow_matrix=flow_matrix,
                 action_summary_by_taz=action_summary,
-                baseline_penalty=baseline_penalty if done else None,
+                baseline_penalty=reference_penalty if done else None,
                 terminal_penalty=terminal_penalty if done else None,
                 config=bundle["reward_config"],
             )
@@ -1519,6 +1545,8 @@ def _run_single_evaluation(
     local_greedy_metrics = None
     local_stochastic_runs = []
     local_stochastic_mean = None
+    local_reference_penalty = None
+    local_reference_components = {}
     if run_local:
         print("[LOCAL GREEDY] Running deterministic local-only controller.")
         sumo.changeRouteFilePath(route_folder_path)
@@ -1534,6 +1562,10 @@ def _run_single_evaluation(
         local_greedy_metrics["local_rollout"] = rollout["local_rollout"]
         local_greedy_metrics["group_action_details"] = rollout["group_action_details"]
         local_greedy_metrics["group_signal_by_taz"] = rollout["group_signal_by_taz"]
+        local_greedy_metrics["terminal_reward"] = rollout["terminal_reward"]
+        local_reference_components = dict(rollout["terminal_reward"])
+        if bool(local_reference_components.get("parse_ok", False)):
+            local_reference_penalty = float(local_reference_components.get("penalty", 0.0))
         _cleanup_run_outputs(local_greedy_run_dir, args.keep_raw_output)
 
         for run_idx in range(args.stochastic_runs):
@@ -1559,11 +1591,26 @@ def _run_single_evaluation(
     coordinated_greedy_metrics = None
     coordinated_stochastic_runs = []
     coordinated_stochastic_mean = None
+    coordination_reference_mode = None
+    coordination_reference_penalty = None
     if run_coordinated:
+        coordination_reference_mode = str(coordinated_bundle.get("coordination_reference_mode", "no_agent_baseline"))
+        if coordination_reference_mode in ("local_only", "local_reference") and local_reference_penalty is not None:
+            coordination_reference_penalty = local_reference_penalty
+        else:
+            coordination_reference_mode = "no_agent_baseline"
+            coordination_reference_penalty = baseline_penalty
         print("[COORDINATED GREEDY] Running deterministic coordinated controller.")
         sumo.changeRouteFilePath(route_folder_path)
         sumo.changeTypePath(coordinated_greedy_run_dir)
-        rollout = _run_rl_episode(env, coordinated_bundle, adjacency_matrix, episode, deterministic=True, baseline_penalty=baseline_penalty)
+        rollout = _run_rl_episode(
+            env,
+            coordinated_bundle,
+            adjacency_matrix,
+            episode,
+            deterministic=True,
+            reference_penalty=coordination_reference_penalty,
+        )
         coordinated_greedy_metrics = _collect_run_metrics(
             coordinated_greedy_run_dir,
             waiting_components=rollout["terminal_reward"],
@@ -1574,6 +1621,7 @@ def _run_single_evaluation(
         coordinated_greedy_metrics["coordination_rollout"] = rollout["coordination_rollout"]
         coordinated_greedy_metrics["group_action_details"] = rollout["group_action_details"]
         coordinated_greedy_metrics["group_signal_by_taz"] = rollout["group_signal_by_taz"]
+        coordinated_greedy_metrics["terminal_reward"] = rollout["terminal_reward"]
         _cleanup_run_outputs(coordinated_greedy_run_dir, args.keep_raw_output)
 
         for run_idx in range(args.stochastic_runs):
@@ -1582,7 +1630,14 @@ def _run_single_evaluation(
             print(f"[COORDINATED STOCHASTIC] Run {run_idx + 1}/{args.stochastic_runs}.")
             sumo.changeRouteFilePath(route_folder_path)
             sumo.changeTypePath(run_dir)
-            rollout = _run_rl_episode(env, coordinated_bundle, adjacency_matrix, episode, deterministic=False, baseline_penalty=baseline_penalty)
+            rollout = _run_rl_episode(
+                env,
+                coordinated_bundle,
+                adjacency_matrix,
+                episode,
+                deterministic=False,
+                reference_penalty=coordination_reference_penalty,
+            )
             metrics = _collect_run_metrics(
                 run_dir,
                 waiting_components=rollout["terminal_reward"],
@@ -1613,6 +1668,9 @@ def _run_single_evaluation(
         "taz_ids": taz_ids,
         "tls_ids": env.get_tls_ids(),
         "coordination_price_bins": list(coordinated_bundle["price_bins"]) if run_coordinated else None,
+        "coordination_reference_mode": coordination_reference_mode if run_coordinated else None,
+        "coordination_reference_penalty": coordination_reference_penalty if run_coordinated else None,
+        "local_reference_penalty": local_reference_penalty if run_local else None,
         "adjacency_metadata": adjacency_metadata,
         "coordinator_obs_dim": int(coordinated_bundle["coordinator_obs_dim"]) if run_coordinated else None,
         "coordinated_local_obs_dim": int(coordinated_bundle["local_obs_dim"]) if run_coordinated else None,
