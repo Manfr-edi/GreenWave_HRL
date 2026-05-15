@@ -69,6 +69,15 @@ def _maybe_load_local_checkpoint(policy, optimizer, scheduler) -> int:
     if not LOAD_LOCAL_CHECKPOINT:
         return int(START_EPISODE_OVERRIDE or 0)
     checkpoint = load_checkpoint(LOCAL_CHECKPOINT_PATH)
+    checkpoint_obs_dim = checkpoint.get("obs_dim")
+    target_obs_dim = int(policy.extractor.net[0].normalized_shape[0])
+    if checkpoint_obs_dim is not None and int(checkpoint_obs_dim) != target_obs_dim:
+        print(
+            "[WARN] Skipping local checkpoint with incompatible observation width: "
+            f"checkpoint={int(checkpoint_obs_dim)} current={target_obs_dim}. "
+            "Start a fresh local run after removing emission features from the observation."
+        )
+        return int(START_EPISODE_OVERRIDE or 0)
     state_dict = checkpoint.get("local_controller_state_dict", checkpoint.get("model_state_dict"))
     if state_dict is None:
         raise KeyError("Local checkpoint must contain local_controller_state_dict or model_state_dict.")

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import torch
 
 
-TAZ_FEATURE_DIM = 14
+TAZ_FEATURE_DIM = 12
 COORDINATION_PRICE_BINS = (0.0, 0.5, 1.0, 1.5, 2.0)
 
 

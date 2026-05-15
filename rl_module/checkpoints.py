@@ -62,17 +62,29 @@ def load_checkpoint(path: str) -> dict:
     return torch.load(path, map_location="cpu", weights_only=True)
 
 
-def load_local_controller_weights(policy, checkpoint_path: str, base_obs_dim: int):
+def load_local_controller_weights(policy, checkpoint_path: str, base_obs_dim: int) -> bool:
     """Load a pretrained local controller into a price-augmented local policy."""
 
     checkpoint = load_checkpoint(checkpoint_path)
+    checkpoint_obs_dim = checkpoint.get("base_obs_dim", checkpoint.get("obs_dim"))
+    if checkpoint_obs_dim is not None and int(checkpoint_obs_dim) != int(base_obs_dim):
+        print(
+            "[WARN] Skipping local pretraining checkpoint with incompatible observation width: "
+            f"checkpoint={int(checkpoint_obs_dim)} current={int(base_obs_dim)}. "
+            "Retrain the local controller with the emission-free observation before using it as pretraining."
+        )
+        return False
     source = checkpoint.get(
         "local_controller_state_dict",
         checkpoint.get("model_state_dict", checkpoint.get("local_model_state_dict", checkpoint)),
     )
-    if hasattr(policy, "load_base_state_dict"):
-        policy.load_base_state_dict(source)
-        return
+    try:
+        if hasattr(policy, "load_base_state_dict"):
+            policy.load_base_state_dict(source)
+            return True
+    except RuntimeError as exc:
+        print(f"[WARN] Could not load local pretraining checkpoint: {exc}")
+        return False
     target = policy.state_dict()
     patched = {}
     for key, target_tensor in target.items():
@@ -96,7 +108,12 @@ def load_local_controller_weights(policy, checkpoint_path: str, base_obs_dim: in
         else:
             print(f"[WARN] Skipping incompatible local checkpoint tensor: {key}")
         patched[key] = next_tensor
-    policy.load_state_dict(patched)
+    try:
+        policy.load_state_dict(patched)
+    except RuntimeError as exc:
+        print(f"[WARN] Could not load local pretraining checkpoint: {exc}")
+        return False
+    return True
 
 
 def maybe_resume_coordinated_checkpoint(

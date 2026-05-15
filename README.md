@@ -148,7 +148,7 @@ single flattened city-level observation.
                                       v
                                 SUMO + TraCI
                                       |
-              E2 detectors, vehicle states, TLS programs, emissions
+              E2 detectors, vehicle states, TLS programs
                                       |
                                       v
                             CoordinatedTazTrafficEnv
@@ -233,9 +233,9 @@ non-price part contains:
 - per-TLS blocks for all TLS slots in the TAZ, padded to the maximum TLS count:
   presence flag, current editable green phase as one-hot, normalized phase
   duration, mean speed, max jam, occupancy, E2 vehicle count, pressure, active
-  vehicle count, total waiting time, average waiting time, CO2, and NOx;
+  vehicle count, total waiting time, and average waiting time;
 - one TAZ aggregate block: max jam, mean speed, mean occupancy, detector
-  vehicle total, active vehicles, total waiting time, CO2, NOx, hour
+  vehicle total, active vehicles, total waiting time, hour
   sine/cosine, and deltas since the previous action for waiting time, active
   vehicles, jam, and speed;
 - one grouped-control block per local group: presence, normalized group size,
@@ -246,7 +246,9 @@ In coordinated training, three additional price-context features are appended
 to each TAZ row: own normalized coordinator price, neighbor mean price, and the
 own-minus-neighbor price gap. The observation sources are E2 detector records,
 TraCI vehicle metrics, traffic-light phase/program state, network topology,
-and episode hour. The runtime action mask removes padded groups and can
+and episode hour. Emission metrics are intentionally excluded from both local and
+coordinator observations; they remain available only for reward computation and
+evaluation. The runtime action mask removes padded groups and can
 optionally disable groups whose traffic signal is below
 `action_signal_threshold`.
 
@@ -312,7 +314,7 @@ traffic-light actions.
 **Observation.** The coordinator receives one flattened city-level observation
 built by `build_coordination_observation`:
 
-- the 14-dimensional TAZ aggregate feature block extracted from every local TAZ
+- the 12-dimensional TAZ aggregate feature block extracted from every local TAZ
   observation;
 - neighbor-mean TAZ features using the adjacency matrix built from TAZ polygons
   (`taz_adjacency_distance_threshold=80.0`, fallback to the nearest 3 TAZs when

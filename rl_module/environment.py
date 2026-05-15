@@ -256,8 +256,8 @@ class LocalTazTrafficEnv(EnvBase):
 
         self.tls_by_taz = {taz: list(self.taz_tls_map[taz]) for taz in self.taz_ids}
         self.max_tls_per_taz = max(len(v) for v in self.tls_by_taz.values())
-        self.per_tls_feature_dim = 1 + self.max_num_phases + 11
-        self.per_taz_feature_dim = 14
+        self.per_tls_feature_dim = 1 + self.max_num_phases + 9
+        self.per_taz_feature_dim = 12
         self.agent_obs_dim = self.max_tls_per_taz * self.per_tls_feature_dim + self.per_taz_feature_dim
 
         self.observation_spec = UnboundedSpec(
@@ -1303,8 +1303,6 @@ class LocalTazTrafficEnv(EnvBase):
                             float(np.clip(self._safe_float(metrics.get("active_vehicle_count", 0.0), 0.0) / self.tls_active_vehicle_ref, 0.0, 5.0)),
                             float(np.clip(self._safe_float(metrics.get("total_waiting_time", 0.0), 0.0) / self.tls_waiting_time_ref, 0.0, 5.0)),
                             float(np.clip(self._safe_float(metrics.get("avg_waiting_time", 0.0), 0.0) / self.waiting_ref, 0.0, 5.0)),
-                            float(np.clip(self._safe_float(metrics.get("total_co2", 0.0), 0.0) / self.tls_co2_ref, 0.0, 5.0)),
-                            float(np.clip(self._safe_float(metrics.get("total_nox", 0.0), 0.0) / self.tls_nox_ref, 0.0, 5.0)),
                         ]
                     )
                 else:
@@ -1358,8 +1356,6 @@ class LocalTazTrafficEnv(EnvBase):
                     float(np.clip(self._safe_float(taz_metrics.get("veh_total", 0.0), 0.0) / self.taz_veh_total_ref, 0.0, 5.0)),
                     float(np.clip(self._safe_float(taz_metrics.get("active_vehicle_count", 0.0), 0.0) / self.taz_veh_total_ref, 0.0, 5.0)),
                     float(np.clip(self._safe_float(taz_metrics.get("total_waiting_time", 0.0), 0.0) / self.taz_waiting_time_ref, 0.0, 5.0)),
-                    float(np.clip(self._safe_float(taz_metrics.get("total_co2", 0.0), 0.0) / self.taz_co2_ref, 0.0, 5.0)),
-                    float(np.clip(self._safe_float(taz_metrics.get("total_nox", 0.0), 0.0) / self.taz_nox_ref, 0.0, 5.0)),
                     hour_sin,
                     hour_cos,
                     waiting_delta_norm,

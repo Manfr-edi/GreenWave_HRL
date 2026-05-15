@@ -299,25 +299,51 @@ def main():
         adapter_scale=COORDINATOR.price_adapter_scale,
     ).to(device)
     local_reference_controller = MultiDiscreteActorCritic(base_obs_dim, local_act_dim, LOCAL_CONTROLLER.action_bins).to(device)
+    train_local_base_policy = bool(LOCAL_CONTROLLER.train_local_policy)
     if LOCAL_CONTROLLER.load_pretrained:
         # The coordinated stage is normally initialized from the local-only
         # checkpoint. If it is missing, training still works from random weights.
         if os.path.exists(LOCAL_CONTROLLER.pretrained_checkpoint_path):
-            load_local_controller_weights(local_controller, LOCAL_CONTROLLER.pretrained_checkpoint_path, base_obs_dim=base_obs_dim)
-            load_local_controller_weights(local_reference_controller, LOCAL_CONTROLLER.pretrained_checkpoint_path, base_obs_dim=base_obs_dim)
+            pretrained_loaded = load_local_controller_weights(
+                local_controller,
+                LOCAL_CONTROLLER.pretrained_checkpoint_path,
+                base_obs_dim=base_obs_dim,
+            )
+            reference_loaded = False
+            if pretrained_loaded:
+                reference_loaded = load_local_controller_weights(
+                    local_reference_controller,
+                    LOCAL_CONTROLLER.pretrained_checkpoint_path,
+                    base_obs_dim=base_obs_dim,
+            )
+            if not pretrained_loaded:
+                print("[WARN] Starting coordinated local controller from random weights.")
+                local_reference_controller.load_state_dict(local_controller.base_policy.state_dict())
+                if not train_local_base_policy:
+                    print("[WARN] No compatible local pretraining was loaded; enabling local base-policy training.")
+                    train_local_base_policy = True
+            elif not reference_loaded:
+                print("[WARN] Local reference controller could not load the checkpoint; using the current base policy.")
+                local_reference_controller.load_state_dict(local_controller.base_policy.state_dict())
         else:
             print(f"[WARN] Local pretraining checkpoint not found: {LOCAL_CONTROLLER.pretrained_checkpoint_path}")
             print("[WARN] Starting coordinated local controller from random weights.")
             local_reference_controller.load_state_dict(local_controller.base_policy.state_dict())
+            if not train_local_base_policy:
+                print("[WARN] No compatible local pretraining was loaded; enabling local base-policy training.")
+                train_local_base_policy = True
     else:
         local_reference_controller.load_state_dict(local_controller.base_policy.state_dict())
+        if not train_local_base_policy:
+            print("[WARN] Local pretraining disabled; enabling local base-policy training.")
+            train_local_base_policy = True
     local_reference_controller.eval()
     for parameter in local_reference_controller.parameters():
         parameter.requires_grad_(False)
 
-    local_trainable = bool(LOCAL_CONTROLLER.train_local_policy or LOCAL_CONTROLLER.train_price_adapter)
+    local_trainable = bool(train_local_base_policy or LOCAL_CONTROLLER.train_price_adapter)
     local_controller.configure_trainable(
-        train_base_policy=LOCAL_CONTROLLER.train_local_policy,
+        train_base_policy=train_local_base_policy,
         train_price_adapter=LOCAL_CONTROLLER.train_price_adapter,
     )
     local_controller.train(mode=local_trainable)
@@ -394,7 +420,7 @@ def main():
     )
     print(
         f"[INFO] coordination_reference_mode={COORDINATOR.coordination_reference_mode} | "
-        f"train_local_policy={LOCAL_CONTROLLER.train_local_policy} | "
+        f"train_local_policy={train_local_base_policy} | "
         f"train_price_adapter={LOCAL_CONTROLLER.train_price_adapter}"
     )
     print(f"[INFO] demand_noise_range={DEMAND.demand_noise_range} | schedule_shuffle={EXPERIMENT.shuffle_episode_schedule}")
