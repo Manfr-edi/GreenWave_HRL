@@ -588,6 +588,55 @@ def _build_local_policy_bundle(checkpoint: dict, env: CoordinatedTazTrafficEnv) 
     }
 
 
+def _align_observation_width(observation: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Pad or truncate the last feature dimension to a target width."""
+
+    target = int(target_dim)
+    current = int(observation.shape[-1])
+    if current == target:
+        return observation
+    if current > target:
+        return observation[..., :target]
+    return torch.nn.functional.pad(observation, (0, target - current))
+
+
+def _build_price_context_tensor(
+    local_observation: torch.Tensor,
+    price_values: torch.Tensor,
+    adjacency_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """Build the same 3-dim price context used by coordinated training."""
+
+    prices = price_values.reshape(-1).to(device=local_observation.device, dtype=local_observation.dtype)
+    adjacency = adjacency_matrix.to(device=local_observation.device, dtype=local_observation.dtype)
+    price_norm = prices / max(max(COORDINATION_PRICE_BINS), 1e-6)
+    neighbor_price = adjacency.matmul(price_norm.unsqueeze(-1)).squeeze(-1) / adjacency.sum(dim=-1).clamp_min(1.0)
+    return torch.stack([price_norm, neighbor_price, price_norm - neighbor_price], dim=-1)
+
+
+def _prepare_coordinated_local_observation(
+    local_observation: torch.Tensor,
+    bundle: dict,
+    price_values: torch.Tensor,
+    adjacency_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """Match local policy input width even when env and checkpoint schemas differ."""
+
+    local_policy = bundle["local_policy"]
+    local_policy_class = str(bundle.get("local_policy_class", ""))
+    if local_policy_class == "PriceAdapterActorCritic":
+        base_obs_dim = int(getattr(local_policy, "base_obs_dim", local_observation.shape[-1]))
+        price_context_dim = int(getattr(local_policy, "price_context_dim", 3))
+        base_obs = _align_observation_width(local_observation, base_obs_dim)
+        price_context = _build_price_context_tensor(local_observation, price_values, adjacency_matrix)
+        price_context = _align_observation_width(price_context, price_context_dim)
+        return torch.cat([base_obs, price_context], dim=-1)
+
+    augmented = augment_local_observation_with_prices(local_observation, price_values, adjacency_matrix)
+    local_obs_dim = int(bundle.get("local_obs_dim", augmented.shape[-1]))
+    return _align_observation_width(augmented, local_obs_dim)
+
+
 def _matrix_to_nested_dict(matrix: torch.Tensor, taz_ids: list[str]) -> dict:
     matrix_cpu = matrix.detach().cpu()
     return {
@@ -612,7 +661,7 @@ def _run_local_episode(env, bundle: dict, episode: EpisodeDemand, deterministic:
 
     with torch.no_grad():
         while True:
-            local_obs = td["observation"]
+            local_obs = _align_observation_width(td["observation"], int(bundle.get("local_obs_dim", td["observation"].shape[-1])))
             action_mask = td["action_mask"].bool()
             action_index, _, _ = bundle["local_policy"].act(local_obs, action_mask, deterministic=deterministic)
             step_td = env.step(TensorDict({"action": action_index}, batch_size=[], device=device))
@@ -692,8 +741,13 @@ def _run_rl_episode(
             coordinator_action_mask = torch.ones((1, num_taz), dtype=torch.bool, device=device)
             coordinator_action_index, _, _ = bundle["coordinator"].act(coordinator_obs, coordinator_action_mask, deterministic=deterministic)
             price_values = bundle["coordinator"].action_values(coordinator_action_index).squeeze(0)
-            augmented_local_obs = augment_local_observation_with_prices(local_obs, price_values, adjacency_matrix)
-            local_action_index, _, _ = bundle["local_policy"].act(augmented_local_obs, action_mask, deterministic=deterministic)
+            policy_local_obs = _prepare_coordinated_local_observation(
+                local_observation=local_obs,
+                bundle=bundle,
+                price_values=price_values,
+                adjacency_matrix=adjacency_matrix,
+            )
+            local_action_index, _, _ = bundle["local_policy"].act(policy_local_obs, action_mask, deterministic=deterministic)
             step_td = env.step(TensorDict({"action": local_action_index}, batch_size=[], device=device))
             next_td = step_td["next"] if "next" in step_td.keys() else step_td
             reward_components = dict(getattr(env, "last_reward_components", {}) or {})
