@@ -526,6 +526,7 @@ def _build_policy_bundle(checkpoint: dict, env: CoordinatedTazTrafficEnv, adjace
             taz_ids=taz_ids,
             extra_context=dummy_context,
             config=obs_config,
+            price_max=max(price_bins),
         ).shape[-1]
     )
     coordinator_settings = dict(checkpoint.get("coordinator_settings", {}) or {})
@@ -604,12 +605,15 @@ def _build_price_context_tensor(
     local_observation: torch.Tensor,
     price_values: torch.Tensor,
     adjacency_matrix: torch.Tensor,
+    price_max: float | None = None,
 ) -> torch.Tensor:
     """Build the same 3-dim price context used by coordinated training."""
 
     prices = price_values.reshape(-1).to(device=local_observation.device, dtype=local_observation.dtype)
     adjacency = adjacency_matrix.to(device=local_observation.device, dtype=local_observation.dtype)
-    price_norm = prices / max(max(COORDINATION_PRICE_BINS), 1e-6)
+    if price_max is None:
+        price_max = max(COORDINATION_PRICE_BINS)
+    price_norm = prices / max(float(price_max), 1e-6)
     neighbor_price = adjacency.matmul(price_norm.unsqueeze(-1)).squeeze(-1) / adjacency.sum(dim=-1).clamp_min(1.0)
     return torch.stack([price_norm, neighbor_price, price_norm - neighbor_price], dim=-1)
 
@@ -624,17 +628,68 @@ def _prepare_coordinated_local_observation(
 
     local_policy = bundle["local_policy"]
     local_policy_class = str(bundle.get("local_policy_class", ""))
+    price_max = max(tuple(bundle.get("price_bins", COORDINATION_PRICE_BINS)))
     if local_policy_class == "PriceAdapterActorCritic":
         base_obs_dim = int(getattr(local_policy, "base_obs_dim", local_observation.shape[-1]))
         price_context_dim = int(getattr(local_policy, "price_context_dim", 3))
         base_obs = _align_observation_width(local_observation, base_obs_dim)
-        price_context = _build_price_context_tensor(local_observation, price_values, adjacency_matrix)
+        price_context = _build_price_context_tensor(local_observation, price_values, adjacency_matrix, price_max=price_max)
         price_context = _align_observation_width(price_context, price_context_dim)
         return torch.cat([base_obs, price_context], dim=-1)
 
-    augmented = augment_local_observation_with_prices(local_observation, price_values, adjacency_matrix)
+    augmented = augment_local_observation_with_prices(local_observation, price_values, adjacency_matrix, price_max=price_max)
     local_obs_dim = int(bundle.get("local_obs_dim", augmented.shape[-1]))
     return _align_observation_width(augmented, local_obs_dim)
+
+
+def _accumulate_price_influence_pair(
+    probe: dict,
+    label: str,
+    real_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+    action_mask: torch.Tensor,
+):
+    valid_mask = action_mask.bool()
+    valid_slots = int(valid_mask.sum().item())
+    if valid_slots <= 0:
+        return
+    if label == "real_vs_zero":
+        probe["valid_action_slots"] += valid_slots
+    real_actions = real_logits.argmax(dim=-1)
+    reference_actions = reference_logits.argmax(dim=-1)
+    action_diff = int(((real_actions != reference_actions) & valid_mask).sum().item())
+    probe[f"action_diff_{label}"] += action_diff
+    expanded_mask = valid_mask.unsqueeze(-1).expand_as(real_logits)
+    logit_delta = (real_logits - reference_logits).abs()[expanded_mask]
+    if logit_delta.numel() <= 0:
+        return
+    probe[f"logit_delta_sum_{label}"] += float(logit_delta.sum().item())
+    probe[f"logit_delta_count_{label}"] += int(logit_delta.numel())
+    probe[f"max_abs_logit_delta_{label}"] = max(
+        float(probe[f"max_abs_logit_delta_{label}"]),
+        float(logit_delta.max().item()),
+    )
+
+
+def _finalize_price_influence_probe(probe: dict) -> dict:
+    summary = {
+        "steps": int(probe["steps"]),
+        "nonzero_price_steps": int(probe["nonzero_price_steps"]),
+        "valid_action_slots": int(probe["valid_action_slots"]),
+        "unique_prices": sorted(float(value) for value in probe["unique_prices"]),
+    }
+    for label in ("real_vs_zero", "real_vs_base"):
+        count = int(probe[f"logit_delta_count_{label}"])
+        action_diff = int(probe[f"action_diff_{label}"])
+        valid_slots = int(probe["valid_action_slots"])
+        summary[f"action_diff_{label}"] = action_diff
+        summary[f"action_diff_rate_{label}"] = float(action_diff / valid_slots) if valid_slots > 0 else None
+        summary[f"mean_abs_logit_delta_{label}"] = (
+            float(probe[f"logit_delta_sum_{label}"] / count) if count > 0 else None
+        )
+        summary[f"max_abs_logit_delta_{label}"] = float(probe[f"max_abs_logit_delta_{label}"])
+    summary["price_channel_changed_actions"] = bool(summary["action_diff_real_vs_zero"] > 0)
+    return summary
 
 
 def _matrix_to_nested_dict(matrix: torch.Tensor, taz_ids: list[str]) -> dict:
@@ -717,6 +772,20 @@ def _run_rl_episode(
     step_prices = []
     step_diagnostics = []
     step_flows = []
+    price_influence_probe = {
+        "steps": 0,
+        "nonzero_price_steps": 0,
+        "valid_action_slots": 0,
+        "unique_prices": set(),
+        "action_diff_real_vs_zero": 0,
+        "action_diff_real_vs_base": 0,
+        "logit_delta_sum_real_vs_zero": 0.0,
+        "logit_delta_sum_real_vs_base": 0.0,
+        "logit_delta_count_real_vs_zero": 0,
+        "logit_delta_count_real_vs_base": 0,
+        "max_abs_logit_delta_real_vs_zero": 0.0,
+        "max_abs_logit_delta_real_vs_base": 0.0,
+    }
     if reference_penalty is not None:
         env.set_baseline_penalty(reference_penalty)
     else:
@@ -737,6 +806,7 @@ def _run_rl_episode(
                 taz_ids=taz_ids,
                 extra_context=_global_context_tensor(episode, reference_penalty, device),
                 config=bundle["observation_config"],
+                price_max=max(tuple(bundle.get("price_bins", COORDINATION_PRICE_BINS))),
             )
             coordinator_action_mask = torch.ones((1, num_taz), dtype=torch.bool, device=device)
             coordinator_action_index, _, _ = bundle["coordinator"].act(coordinator_obs, coordinator_action_mask, deterministic=deterministic)
@@ -748,6 +818,38 @@ def _run_rl_episode(
                 adjacency_matrix=adjacency_matrix,
             )
             local_action_index, _, _ = bundle["local_policy"].act(policy_local_obs, action_mask, deterministic=deterministic)
+            price_influence_probe["steps"] += 1
+            if bool((price_values.abs() > 1e-9).any().item()):
+                price_influence_probe["nonzero_price_steps"] += 1
+            for price in price_values.detach().cpu().reshape(-1).tolist():
+                price_influence_probe["unique_prices"].add(round(float(price), 6))
+            real_logits, _ = bundle["local_policy"].forward(policy_local_obs, action_mask)
+            zero_policy_local_obs = _prepare_coordinated_local_observation(
+                local_observation=local_obs,
+                bundle=bundle,
+                price_values=torch.zeros_like(price_values),
+                adjacency_matrix=adjacency_matrix,
+            )
+            zero_logits, _ = bundle["local_policy"].forward(zero_policy_local_obs, action_mask)
+            _accumulate_price_influence_pair(
+                price_influence_probe,
+                "real_vs_zero",
+                real_logits,
+                zero_logits,
+                action_mask,
+            )
+            local_policy = bundle["local_policy"]
+            if hasattr(local_policy, "base_policy"):
+                base_obs_dim = int(getattr(local_policy, "base_obs_dim", local_obs.shape[-1]))
+                base_obs = _align_observation_width(local_obs, base_obs_dim)
+                base_logits, _ = local_policy.base_policy.forward(base_obs, action_mask)
+                _accumulate_price_influence_pair(
+                    price_influence_probe,
+                    "real_vs_base",
+                    real_logits,
+                    base_logits,
+                    action_mask,
+                )
             step_td = env.step(TensorDict({"action": local_action_index}, batch_size=[], device=device))
             next_td = step_td["next"] if "next" in step_td.keys() else step_td
             reward_components = dict(getattr(env, "last_reward_components", {}) or {})
@@ -772,6 +874,7 @@ def _run_rl_episode(
                 baseline_penalty=reference_penalty if done else None,
                 terminal_penalty=terminal_penalty if done else None,
                 config=bundle["reward_config"],
+                price_max=max(tuple(bundle.get("price_bins", COORDINATION_PRICE_BINS))),
             )
             diag["coordinator_reward"] = float(coordinator_reward)
             step_prices.append({taz: float(price_values[idx].item()) for idx, taz in enumerate(taz_ids)})
@@ -784,6 +887,13 @@ def _run_rl_episode(
                 break
             td = next_td
 
+    price_influence = _finalize_price_influence_probe(price_influence_probe)
+    if price_influence["nonzero_price_steps"] > 0 and price_influence["action_diff_real_vs_zero"] == 0:
+        print(
+            "[WARN] Coordinator prices were non-zero but did not change any local greedy action "
+            f"(max_abs_logit_delta={price_influence['max_abs_logit_delta_real_vs_zero']:.6g})."
+        )
+
     return {
         "terminal_reward": dict((env.last_reward_components or {}).get("terminal_reward", {}) or {}),
         "group_action_details": dict((env.last_reward_components or {}).get("group_action_details", {}) or {}),
@@ -793,6 +903,7 @@ def _run_rl_episode(
             "price_by_step": step_prices,
             "flow_by_step": step_flows,
             "step_diagnostics": step_diagnostics,
+            "price_influence": price_influence,
             "episode_flow_by_taz": env.get_coordination_flow_diagnostics().get("episode_flow_by_taz", {}),
         },
     }

@@ -116,7 +116,7 @@ def load_local_controller_weights(policy, checkpoint_path: str, base_obs_dim: in
     return True
 
 
-def maybe_resume_coordinated_checkpoint(
+def resume_coordinated_checkpoint(
     checkpoint_path: str,
     enabled: bool,
     resume_episode: bool,

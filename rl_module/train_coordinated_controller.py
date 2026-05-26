@@ -25,7 +25,7 @@ from rl_module.checkpoints import (
     checkpoint_score_from_baseline,
     checkpoint_score_from_reference,
     load_local_controller_weights,
-    maybe_resume_coordinated_checkpoint,
+    resume_coordinated_checkpoint,
     write_history_header,
 )
 from rl_module.coordination import (
@@ -55,7 +55,7 @@ from rl_module.traffic_demand import cleanup_sumo_output_files, build_episode_sc
 
 
 LOAD_COORDINATED_CHECKPOINT = False
-COORDINATED_CHECKPOINT_PATH = os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_final.pt")
+COORDINATED_CHECKPOINT_PATH = os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_best.pt")
 RESUME_FROM_CHECKPOINT_EPISODE = True
 START_EPISODE_OVERRIDE = None
 
@@ -93,6 +93,7 @@ def _build_coordinator_obs_dim(env, adjacency_matrix: torch.Tensor, device: torc
             taz_ids=env.get_taz_ids(),
             extra_context=dummy_context,
             config=DEFAULT_OBSERVATION_CONFIG,
+            price_max=max(COORDINATOR.price_bins),
         ).shape[-1]
     )
 
@@ -368,7 +369,7 @@ def main():
     coordinator_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         coordinator_optimizer, mode="max", factor=0.7, patience=15, threshold=0.005, threshold_mode="rel", min_lr=1e-5
     )
-    start_episode = maybe_resume_coordinated_checkpoint(
+    start_episode = resume_coordinated_checkpoint(
         checkpoint_path=COORDINATED_CHECKPOINT_PATH,
         enabled=LOAD_COORDINATED_CHECKPOINT,
         resume_episode=RESUME_FROM_CHECKPOINT_EPISODE,
@@ -395,7 +396,9 @@ def main():
         "coordination_reference_penalty",
         "checkpoint_score", "checkpoint_score_metric", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
         "coordination_adjustment_mean", "coordinator_reward_mean", "coordinator_price_mean",
-        "coordinator_price_std", "spillover_mean", "imbalance_mean", "episode_flow_total",
+        "coordinator_price_std", "mean_emission_penalty", "max_emission_penalty",
+        "mean_emission_delta", "total_emission_delta", "worst_taz_worsening",
+        "emission_spillover_mean", "emission_imbalance_mean", "spillover_mean", "imbalance_mean", "episode_flow_total",
         "local_ppo_total_loss", "coordinator_ppo_total_loss", "local_learning_rate", "coordinator_learning_rate",
         "random_trip_seed", "route_sampler_seed", "route_folder_path",
     ]
@@ -513,11 +516,17 @@ def main():
                 taz_ids=taz_ids,
                 extra_context=_global_context_tensor(episode, coordination_reference_penalty, device),
                 config=DEFAULT_OBSERVATION_CONFIG,
+                price_max=max(COORDINATOR.price_bins),
             )
             coordinator_action_mask = torch.ones((1, num_taz), dtype=torch.bool, device=device)
             coordinator_action_index, coordinator_logp, coordinator_value = coordinator.act(coordinator_obs, coordinator_action_mask)
             price_values = coordinator.action_values(coordinator_action_index).squeeze(0)
-            augmented_local_obs = augment_local_observation_with_prices(local_obs, price_values, adjacency_matrix)
+            augmented_local_obs = augment_local_observation_with_prices(
+                local_obs,
+                price_values,
+                adjacency_matrix,
+                price_max=max(COORDINATOR.price_bins),
+            )
             local_action_index, local_logp, local_value = local_controller.act(augmented_local_obs, action_mask)
 
             try:
@@ -551,6 +560,7 @@ def main():
                 baseline_penalty=coordination_reference_penalty if done_value > 0.0 else None,
                 terminal_penalty=terminal_penalty if done_value > 0.0 else None,
                 config=DEFAULT_REWARD_CONFIG,
+                price_max=max(COORDINATOR.price_bins),
             )
             shaped_reward_vec = base_reward_vec
             if local_optimizer is not None:
@@ -640,6 +650,13 @@ def main():
         delta_penalty_vs_local_reference = None
         if terminal_penalty is not None and local_reference_penalty is not None:
             delta_penalty_vs_local_reference = float(terminal_penalty - local_reference_penalty)
+        mean_emission_penalty_score = float(np.mean([diag.get("mean_emission_penalty", 0.0) for diag in step_diagnostics]))
+        max_emission_penalty_score = float(np.mean([diag.get("max_emission_penalty", 0.0) for diag in step_diagnostics]))
+        mean_emission_delta_score = float(np.mean([diag.get("mean_emission_delta", 0.0) for diag in step_diagnostics]))
+        total_emission_delta_score = float(np.mean([diag.get("total_emission_delta", 0.0) for diag in step_diagnostics]))
+        worst_taz_worsening_score = float(np.mean([diag.get("worst_taz_worsening", 0.0) for diag in step_diagnostics]))
+        emission_spillover_score = float(np.mean([diag.get("emission_spillover", 0.0) for diag in step_diagnostics]))
+        emission_imbalance_score = float(np.mean([diag.get("emission_imbalance", 0.0) for diag in step_diagnostics]))
         checkpoint_metric_name = (
             "delta_penalty_vs_local_reference"
             if coordination_reference_label == "local_reference"
@@ -650,6 +667,13 @@ def main():
             coordination_reference_penalty,
             metric_name=checkpoint_metric_name,
         )
+        if checkpoint_score is not None:
+            checkpoint_score = float(
+                checkpoint_score
+                + 0.50 * emission_imbalance_score
+                + 0.50 * worst_taz_worsening_score
+            )
+            checkpoint_metric = f"{checkpoint_metric}+emission_imbalance+worse_taz"
         base_local_reward = torch.stack(local_rollout["base_rewards"]).sum(dim=0)
         shaped_local_reward = torch.stack(local_rollout["rewards"]).sum(dim=0)
         coordinator_prices = torch.cat([coordinator.action_values(actions).reshape(-1).detach().cpu() for actions in coordinator_rollout["actions"]])
@@ -687,6 +711,13 @@ def main():
             "coordinator_reward_mean": float(coordinator_rewards_t.mean().item()),
             "coordinator_price_mean": float(coordinator_prices.float().mean().item()),
             "coordinator_price_std": float(coordinator_prices.float().std(unbiased=False).item()),
+            "mean_emission_penalty": mean_emission_penalty_score,
+            "max_emission_penalty": max_emission_penalty_score,
+            "mean_emission_delta": mean_emission_delta_score,
+            "total_emission_delta": total_emission_delta_score,
+            "worst_taz_worsening": worst_taz_worsening_score,
+            "emission_spillover_mean": emission_spillover_score,
+            "emission_imbalance_mean": emission_imbalance_score,
             "spillover_mean": float(np.mean([diag.get("spillover", 0.0) for diag in step_diagnostics])),
             "imbalance_mean": float(np.mean([diag.get("imbalance", 0.0) for diag in step_diagnostics])),
             "episode_flow_total": float(env.get_episode_flow_matrix().sum()),

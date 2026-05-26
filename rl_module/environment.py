@@ -290,6 +290,7 @@ class LocalTazTrafficEnv(EnvBase):
         self.reference_penalty = None
         self.reference_reward_components = {}
         self._prev_taz_penalties = np.zeros(len(self.taz_ids), dtype=np.float32)
+        self._prev_taz_penalty_details = {}
         self._prev_action_taz_metrics = None
         self._action_signal_by_taz = {
             taz: 0.0
@@ -1223,6 +1224,31 @@ class LocalTazTrafficEnv(EnvBase):
             }
         return np.asarray(penalties, dtype=np.float32), details
 
+    def _build_taz_penalty_deltas(self, penalty_details: dict) -> dict:
+        tracked_keys = (
+            "penalty",
+            "waiting_penalty",
+            "emission_penalty",
+            "co2_penalty",
+            "nox_penalty",
+            "jam_penalty",
+            "total_waiting_time",
+            "total_co2",
+            "total_nox",
+        )
+        deltas = {}
+        for taz in self.taz_ids:
+            current = dict((penalty_details or {}).get(taz, {}) or {})
+            previous = dict((self._prev_taz_penalty_details or {}).get(taz, {}) or {})
+            deltas[taz] = {
+                key: float(
+                    self._safe_float(previous.get(key, current.get(key, 0.0)), 0.0)
+                    - self._safe_float(current.get(key, 0.0), 0.0)
+                )
+                for key in tracked_keys
+            }
+        return deltas
+
     def _compute_dense_reward_vector(self, penalties: np.ndarray) -> np.ndarray:
         delta = self._prev_taz_penalties - penalties
         reward_vector = (
@@ -1623,8 +1649,9 @@ class LocalTazTrafficEnv(EnvBase):
         }
 
         obs = self._collect_observation()
-        penalties, _ = self._build_taz_penalties()
+        penalties, penalty_details = self._build_taz_penalties()
         self._prev_taz_penalties = penalties.copy()
+        self._prev_taz_penalty_details = dict(penalty_details)
         return TensorDict(
             {
                 "observation": obs,
@@ -1696,6 +1723,19 @@ class LocalTazTrafficEnv(EnvBase):
             taz: float(self._prev_taz_penalties[idx] - penalties[idx])
             for idx, taz in enumerate(self.taz_ids)
         }
+        delta_penalty_details_by_taz = self._build_taz_penalty_deltas(penalty_details)
+        delta_emission_penalty_by_taz = {
+            taz: float(delta_penalty_details_by_taz[taz]["emission_penalty"])
+            for taz in self.taz_ids
+        }
+        delta_co2_penalty_by_taz = {
+            taz: float(delta_penalty_details_by_taz[taz]["co2_penalty"])
+            for taz in self.taz_ids
+        }
+        delta_nox_penalty_by_taz = {
+            taz: float(delta_penalty_details_by_taz[taz]["nox_penalty"])
+            for taz in self.taz_ids
+        }
 
         reward_basis = self._describe_step_reward_basis()
 
@@ -1706,6 +1746,10 @@ class LocalTazTrafficEnv(EnvBase):
             "penalty_by_taz": penalty_by_taz,
             "penalty_details_by_taz": penalty_details,
             "delta_penalty_by_taz": delta_penalty_by_taz,
+            "delta_penalty_details_by_taz": delta_penalty_details_by_taz,
+            "delta_emission_penalty_by_taz": delta_emission_penalty_by_taz,
+            "delta_co2_penalty_by_taz": delta_co2_penalty_by_taz,
+            "delta_nox_penalty_by_taz": delta_nox_penalty_by_taz,
             "reward_mean": float(np.mean(reward_vector)),
             "reward_std": float(np.std(reward_vector)),
             "reward_min": float(np.min(reward_vector)),
@@ -1732,6 +1776,7 @@ class LocalTazTrafficEnv(EnvBase):
             "warmup": bool(self.current_step <= self.warmupSteps),
         }
         self._prev_taz_penalties = penalties.copy()
+        self._prev_taz_penalty_details = dict(penalty_details)
 
         return TensorDict(
             {
@@ -2548,6 +2593,19 @@ class GroupedTazTrafficEnv(LocalTazTrafficEnv):
             taz: float(self._prev_taz_penalties[idx] - penalties[idx])
             for idx, taz in enumerate(self.taz_ids)
         }
+        delta_penalty_details_by_taz = self._build_taz_penalty_deltas(penalty_details)
+        delta_emission_penalty_by_taz = {
+            taz: float(delta_penalty_details_by_taz[taz]["emission_penalty"])
+            for taz in self.taz_ids
+        }
+        delta_co2_penalty_by_taz = {
+            taz: float(delta_penalty_details_by_taz[taz]["co2_penalty"])
+            for taz in self.taz_ids
+        }
+        delta_nox_penalty_by_taz = {
+            taz: float(delta_penalty_details_by_taz[taz]["nox_penalty"])
+            for taz in self.taz_ids
+        }
 
         reward_basis = self._describe_step_reward_basis()
 
@@ -2558,6 +2616,10 @@ class GroupedTazTrafficEnv(LocalTazTrafficEnv):
             "penalty_by_taz": penalty_by_taz,
             "penalty_details_by_taz": penalty_details,
             "delta_penalty_by_taz": delta_penalty_by_taz,
+            "delta_penalty_details_by_taz": delta_penalty_details_by_taz,
+            "delta_emission_penalty_by_taz": delta_emission_penalty_by_taz,
+            "delta_co2_penalty_by_taz": delta_co2_penalty_by_taz,
+            "delta_nox_penalty_by_taz": delta_nox_penalty_by_taz,
             "reward_mean": float(np.mean(reward_vector)),
             "reward_std": float(np.std(reward_vector)),
             "reward_min": float(np.min(reward_vector)),
@@ -2589,6 +2651,7 @@ class GroupedTazTrafficEnv(LocalTazTrafficEnv):
             "warmup": bool(self.current_step <= self.warmupSteps),
         }
         self._prev_taz_penalties = penalties.copy()
+        self._prev_taz_penalty_details = dict(penalty_details)
 
         return TensorDict(
             {

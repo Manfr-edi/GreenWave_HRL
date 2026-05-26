@@ -26,11 +26,11 @@ class ExperimentSettings:
     name: str = "coordinated_controller"
     start_date: datetime = datetime(2025, 1, 1)
     # This is the target number of training episodes, not a calendar-day window.
-    train_days: int = 100
+    train_days: int = 200
     focus_hours: tuple[int, ...] = (7, 8)
     # focus_hours: tuple[int, ...] = (7, 8)
     # Supported values: all, weekdays, weekends, or explicit weekdays like "mon-wed-sat".
-    day_filter: str = "weekends"
+    day_filter: str = "weekdays"
     # day_filter: str = "mon-wed-sat"
     train_on_same_day: bool = False
     shuffle_episode_schedule: bool = False
@@ -164,8 +164,8 @@ class LocalControllerSettings:
     target_kl: float = 0.015
     ppo_epochs: int = 4
     minibatch_size: int = 64
-    load_pretrained: bool = False
-    pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "checkpoints", "local_controller", "local_controller_best.pt")
+    load_pretrained: bool = True
+    pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "checkpoints", "local_controller", "local_controller_episode59.pt")
     # pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "saved_trainings", "weekends_7_8", "checkpoints", "local_controller", "local_controller_best.pt")
     # In the coordinated stage the pretrained local policy should remain the
     # behavioral reference. The coordinator learns through a small price adapter.
@@ -193,7 +193,7 @@ class CoordinatorSettings:
     gae_lambda: float = 0.95
     coordination_reference_mode: str = "local_only"
     price_adapter_hidden_dim: int = 64
-    price_adapter_scale: float = 1.0
+    price_adapter_scale: float = 10.0
 
 
 EXPERIMENT = ExperimentSettings()

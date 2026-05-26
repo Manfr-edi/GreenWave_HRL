@@ -13,6 +13,12 @@ TAZ_FEATURE_DIM = 12
 COORDINATION_PRICE_BINS = (0.0, 0.5, 1.0, 1.5, 2.0)
 
 
+def _price_normalizer(price_max: float | None = None) -> float:
+    if price_max is None:
+        price_max = max(COORDINATION_PRICE_BINS)
+    return max(float(price_max), 1e-6)
+
+
 @dataclass
 class CoordinationObservationConfig:
     """Feature switches for the coordinator observation."""
@@ -29,17 +35,25 @@ class CoordinationObservationConfig:
 
 @dataclass
 class CoordinationRewardConfig:
-    """Weights used by the global reward and local spillover correction."""
+    """Weights used by the emission-first coordinator reward."""
 
-    city_delta_weight: float = 1.00
+    emission_mean_penalty_weight: float = 1.50
+    worst_taz_emission_weight: float = 0.75
+    emission_mean_delta_weight: float = 0.35
+    emission_total_delta_weight: float = 0.10
+    worst_taz_worsening_weight: float = 0.75
+    emission_imbalance_weight: float = 0.75
+    emission_spillover_weight: float = 0.75
+    price_emission_alignment_weight: float = 0.10
     terminal_delta_weight: float = 1.00
+    city_delta_weight: float = 1.00
     imbalance_weight: float = 0.25
     spillover_weight: float = 0.85
     local_externality_weight: float = 0.75
     local_global_share_weight: float = 0.10
     local_bonus_clip: float = 1.5
     global_reward_clip: float = 4.0
-    price_effort_weight: float = 0.03
+    price_effort_weight: float = 0.01
     action_effort_weight: float = 0.25
     flow_ref: float = 100.0
 
@@ -259,6 +273,7 @@ def build_coordination_observation(
     taz_ids: list[str] | None = None,
     extra_context: torch.Tensor | None = None,
     config: CoordinationObservationConfig | None = None,
+    price_max: float | None = None,
 ) -> torch.Tensor:
     """Build the single global observation consumed by the coordinator."""
 
@@ -286,7 +301,7 @@ def build_coordination_observation(
         prices = torch.zeros(features.shape[0], dtype=features.dtype, device=device)
         if previous_prices is not None:
             prices = previous_prices.reshape(-1).to(device=device, dtype=features.dtype)
-        price_norm = prices / max(max(COORDINATION_PRICE_BINS), 1e-6)
+        price_norm = prices / _price_normalizer(price_max)
         neighbor_price = adjacency.matmul(price_norm.unsqueeze(-1)).squeeze(-1) / adjacency.sum(dim=-1).clamp_min(1.0)
         chunks.append(torch.stack([price_norm, neighbor_price, price_norm - neighbor_price], dim=-1).reshape(-1))
     if taz_ids is not None:
@@ -302,12 +317,17 @@ def build_coordination_observation(
     return torch.cat(chunks, dim=0).unsqueeze(0)
 
 
-def augment_local_observation_with_prices(local_observation: torch.Tensor, price_values: torch.Tensor, adjacency_matrix: torch.Tensor) -> torch.Tensor:
+def augment_local_observation_with_prices(
+    local_observation: torch.Tensor,
+    price_values: torch.Tensor,
+    adjacency_matrix: torch.Tensor,
+    price_max: float | None = None,
+) -> torch.Tensor:
     """Append own price, neighbor price, and price gap to each local observation."""
 
     prices = price_values.reshape(-1).to(device=local_observation.device, dtype=local_observation.dtype)
     adjacency = adjacency_matrix.to(device=local_observation.device, dtype=local_observation.dtype)
-    price_norm = prices / max(max(COORDINATION_PRICE_BINS), 1e-6)
+    price_norm = prices / _price_normalizer(price_max)
     neighbor_price = adjacency.matmul(price_norm.unsqueeze(-1)).squeeze(-1) / adjacency.sum(dim=-1).clamp_min(1.0)
     return torch.cat([local_observation, torch.stack([price_norm, neighbor_price, price_norm - neighbor_price], dim=-1)], dim=-1)
 
@@ -321,6 +341,34 @@ def _dict_values_by_taz(taz_ids: list[str], values: dict | None, key: str) -> to
     ], dtype=torch.float32)
 
 
+def _component_values_by_taz(
+    taz_ids: list[str],
+    reward_components: dict,
+    component_key: str,
+    fallback_key: str,
+) -> torch.Tensor:
+    details = dict((reward_components or {}).get("penalty_details_by_taz", {}) or {})
+    fallback = dict((reward_components or {}).get(fallback_key, {}) or {})
+    return torch.tensor([
+        float((details.get(taz_id, {}) or {}).get(component_key, fallback.get(taz_id, 0.0)))
+        for taz_id in taz_ids
+    ], dtype=torch.float32)
+
+
+def _delta_component_values_by_taz(
+    taz_ids: list[str],
+    reward_components: dict,
+    delta_key: str,
+    fallback_key: str = "delta_penalty_by_taz",
+) -> torch.Tensor:
+    values = dict((reward_components or {}).get(delta_key, {}) or {})
+    fallback = dict((reward_components or {}).get(fallback_key, {}) or {})
+    return torch.tensor([
+        float(values.get(taz_id, fallback.get(taz_id, 0.0)))
+        for taz_id in taz_ids
+    ], dtype=torch.float32)
+
+
 def compute_coordination_step_rewards(
     taz_ids: list[str],
     price_values: torch.Tensor,
@@ -330,22 +378,37 @@ def compute_coordination_step_rewards(
     baseline_penalty: float | None = None,
     terminal_penalty: float | None = None,
     config: CoordinationRewardConfig | None = None,
+    price_max: float | None = None,
 ) -> tuple[torch.Tensor, float, dict]:
-    """Compute local spillover correction and scalar coordinator reward."""
+    """Compute emission-focused local correction and scalar coordinator reward."""
 
     cfg = config or DEFAULT_REWARD_CONFIG
     device = price_values.device
     dtype = price_values.dtype
     n_taz = len(taz_ids)
-    penalties = torch.tensor(
-        [float((reward_components.get("penalty_by_taz", {}) or {}).get(taz_id, 0.0)) for taz_id in taz_ids],
-        dtype=dtype,
+    emission_penalties = _component_values_by_taz(taz_ids, reward_components, "emission_penalty", "penalty_by_taz").to(
         device=device,
+        dtype=dtype,
     )
-    delta_penalties = torch.tensor(
-        [float((reward_components.get("delta_penalty_by_taz", {}) or {}).get(taz_id, 0.0)) for taz_id in taz_ids],
-        dtype=dtype,
+    co2_penalties = _component_values_by_taz(taz_ids, reward_components, "co2_penalty", "penalty_by_taz").to(
         device=device,
+        dtype=dtype,
+    )
+    nox_penalties = _component_values_by_taz(taz_ids, reward_components, "nox_penalty", "penalty_by_taz").to(
+        device=device,
+        dtype=dtype,
+    )
+    delta_emission_penalties = _delta_component_values_by_taz(taz_ids, reward_components, "delta_emission_penalty_by_taz").to(
+        device=device,
+        dtype=dtype,
+    )
+    delta_co2_penalties = _delta_component_values_by_taz(taz_ids, reward_components, "delta_co2_penalty_by_taz").to(
+        device=device,
+        dtype=dtype,
+    )
+    delta_nox_penalties = _delta_component_values_by_taz(taz_ids, reward_components, "delta_nox_penalty_by_taz").to(
+        device=device,
+        dtype=dtype,
     )
     prices = price_values.reshape(-1).to(device=device, dtype=dtype)
     flow = flow_matrix.to(device=device, dtype=dtype)
@@ -353,53 +416,85 @@ def compute_coordination_step_rewards(
         flow = torch.zeros((n_taz, n_taz), dtype=dtype, device=device)
 
     flow_share = flow / flow.sum(dim=-1, keepdim=True).clamp_min(1.0)
-    worsening = torch.clamp(-delta_penalties, min=0.0)
-    local_gain = torch.clamp(delta_penalties, min=0.0)
-    normalized_price = prices / max(max(COORDINATION_PRICE_BINS), 1e-6)
+    emission_worsening = torch.clamp(-delta_emission_penalties, min=0.0)
+    emission_gain = torch.clamp(delta_emission_penalties, min=0.0)
+    normalized_price = prices / _price_normalizer(price_max)
     action_effort = _dict_values_by_taz(taz_ids, action_summary_by_taz, "aggressive_action_ratio").to(device=device, dtype=dtype)
     flow_intensity = torch.clamp(flow.sum(dim=-1) / max(float(cfg.flow_ref), 1e-6), min=0.0, max=2.0)
-    downstream_cost = flow_share.matmul(normalized_price * worsening)
-    externality = torch.clamp(
+    downstream_cost = flow_share.matmul(normalized_price * emission_worsening)
+    emission_externality = torch.clamp(
         downstream_cost * (1.0 + cfg.action_effort_weight * action_effort) * (1.0 + 0.25 * flow_intensity)
-        - 0.25 * local_gain,
+        - 0.25 * emission_gain,
         min=0.0,
     )
 
-    city_delta = float(delta_penalties.sum().item())
-    if baseline_penalty is not None and terminal_penalty is not None:
-        city_term = float(baseline_penalty - terminal_penalty)
-        city_reward_basis = "reference_terminal_delta"
-    else:
-        city_term = city_delta
-        city_reward_basis = "step_penalty_delta"
-    imbalance = float(penalties.std(unbiased=False).item()) if penalties.numel() > 1 else 0.0
-    spillover = float(externality.mean().item()) if externality.numel() > 0 else 0.0
+    total_emission_delta = float(delta_emission_penalties.sum().item())
+    mean_emission_delta = float(delta_emission_penalties.mean().item()) if delta_emission_penalties.numel() else 0.0
+    total_emission_penalty = float(emission_penalties.sum().item())
+    mean_emission_penalty = float(emission_penalties.mean().item()) if emission_penalties.numel() else 0.0
+    max_emission_penalty = float(emission_penalties.max().item()) if emission_penalties.numel() else 0.0
+    worst_taz_worsening = float(emission_worsening.max().item()) if emission_worsening.numel() else 0.0
+    emission_imbalance = float(emission_penalties.std(unbiased=False).item()) if emission_penalties.numel() > 1 else 0.0
+    emission_cv = float(emission_imbalance / mean_emission_penalty) if abs(mean_emission_penalty) > 1e-9 else 0.0
+    emission_spillover = float(emission_externality.mean().item()) if emission_externality.numel() > 0 else 0.0
     price_effort = float(normalized_price.abs().mean().item()) if normalized_price.numel() > 0 else 0.0
-    alignment = float((_zscore(normalized_price) * _zscore(worsening)).mean().item()) if n_taz > 1 else 0.0
+    price_emission_alignment = (
+        float((_zscore(normalized_price) * _zscore(emission_worsening)).mean().item())
+        if n_taz > 1
+        else 0.0
+    )
+    city_delta = total_emission_delta
+    if baseline_penalty is not None and terminal_penalty is not None:
+        terminal_reference_delta = float(baseline_penalty - terminal_penalty)
+        city_reward_basis = "step_emission_delta+reference_terminal_delta"
+    else:
+        terminal_reference_delta = 0.0
+        city_reward_basis = "step_emission_delta"
     global_reward = (
-        cfg.city_delta_weight * city_delta
-        + cfg.terminal_delta_weight * city_term
-        - cfg.imbalance_weight * imbalance
-        - cfg.spillover_weight * spillover
+        - cfg.emission_mean_penalty_weight * mean_emission_penalty
+        - cfg.worst_taz_emission_weight * max_emission_penalty
+        + cfg.emission_mean_delta_weight * mean_emission_delta
+        + cfg.emission_total_delta_weight * total_emission_delta
+        + cfg.terminal_delta_weight * terminal_reference_delta
+        - cfg.worst_taz_worsening_weight * worst_taz_worsening
+        - cfg.emission_imbalance_weight * emission_imbalance
+        - cfg.emission_spillover_weight * emission_spillover
         - cfg.price_effort_weight * price_effort
-        + 0.10 * alignment
+        + cfg.price_emission_alignment_weight * price_emission_alignment
     )
     global_reward = max(-cfg.global_reward_clip, min(cfg.global_reward_clip, float(global_reward)))
-    local_adjustment = -cfg.local_externality_weight * externality + cfg.local_global_share_weight * float(city_delta) / max(float(n_taz), 1.0)
+    local_adjustment = -cfg.local_externality_weight * emission_externality - cfg.local_global_share_weight * emission_penalties
     local_adjustment = torch.clamp(local_adjustment, -cfg.local_bonus_clip, cfg.local_bonus_clip)
     diagnostics = {
         "city_delta": float(city_delta),
         "city_reward_basis": city_reward_basis,
-        "city_term": float(city_term),
-        "imbalance": float(imbalance),
-        "spillover": float(spillover),
+        "city_term": float(terminal_reference_delta),
+        "terminal_reference_delta": float(terminal_reference_delta),
+        "mean_emission_delta": float(mean_emission_delta),
+        "total_emission_delta": float(total_emission_delta),
+        "mean_emission_penalty": float(mean_emission_penalty),
+        "total_emission_penalty": float(total_emission_penalty),
+        "max_emission_penalty": float(max_emission_penalty),
+        "worst_taz_worsening": float(worst_taz_worsening),
+        "emission_imbalance": float(emission_imbalance),
+        "emission_cv": float(emission_cv),
+        "emission_spillover": float(emission_spillover),
+        "imbalance": float(emission_imbalance),
+        "spillover": float(emission_spillover),
         "price_effort": float(price_effort),
-        "alignment": float(alignment),
+        "price_emission_alignment": float(price_emission_alignment),
+        "alignment": float(price_emission_alignment),
         "global_reward": float(global_reward),
         "price_by_taz": {taz_id: float(prices[idx].item()) for idx, taz_id in enumerate(taz_ids)},
-        "worsening_by_taz": {taz_id: float(worsening[idx].item()) for idx, taz_id in enumerate(taz_ids)},
-        "local_gain_by_taz": {taz_id: float(local_gain[idx].item()) for idx, taz_id in enumerate(taz_ids)},
-        "externality_by_taz": {taz_id: float(externality[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "emission_penalty_by_taz": {taz_id: float(emission_penalties[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "co2_penalty_by_taz": {taz_id: float(co2_penalties[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "nox_penalty_by_taz": {taz_id: float(nox_penalties[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "delta_emission_penalty_by_taz": {taz_id: float(delta_emission_penalties[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "delta_co2_penalty_by_taz": {taz_id: float(delta_co2_penalties[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "delta_nox_penalty_by_taz": {taz_id: float(delta_nox_penalties[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "worsening_by_taz": {taz_id: float(emission_worsening[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "local_gain_by_taz": {taz_id: float(emission_gain[idx].item()) for idx, taz_id in enumerate(taz_ids)},
+        "externality_by_taz": {taz_id: float(emission_externality[idx].item()) for idx, taz_id in enumerate(taz_ids)},
         "local_adjustment_by_taz": {taz_id: float(local_adjustment[idx].item()) for idx, taz_id in enumerate(taz_ids)},
         "outflow_by_taz": {taz_id: float(flow[idx].sum().item()) for idx, taz_id in enumerate(taz_ids)},
         "inflow_by_taz": {taz_id: float(flow[:, idx].sum().item()) for idx, taz_id in enumerate(taz_ids)},

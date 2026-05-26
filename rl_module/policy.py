@@ -104,8 +104,9 @@ class PriceAdapterActorCritic(nn.Module):
     """Local policy with a small trainable price adapter.
 
     The base local policy consumes the original local observation width. The
-    coordinator price context is mapped to an additive feature residual, so a
-    zero-initialized adapter preserves the pretrained local controller exactly.
+    coordinator price context is mapped both to an additive feature residual
+    and to a direct action-logit bias. The direct bias keeps the coordinator's
+    price signal observable even when the pretrained base policy is frozen.
     """
 
     def __init__(
@@ -132,6 +133,12 @@ class PriceAdapterActorCritic(nn.Module):
             nn.GELU(),
             nn.Linear(int(adapter_hidden_dim), 128),
         )
+        self.price_logit_adapter = nn.Sequential(
+            nn.LayerNorm(self.price_context_dim),
+            nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(adapter_hidden_dim), self.act_dim * self.num_bins),
+        )
         self.register_buffer("action_bins", torch.tensor(action_bins, dtype=torch.float32), persistent=False)
         self._reset_adapter()
 
@@ -140,6 +147,10 @@ class PriceAdapterActorCritic(nn.Module):
         if isinstance(final, nn.Linear):
             nn.init.zeros_(final.weight)
             nn.init.zeros_(final.bias)
+        logit_final = self.price_logit_adapter[-1]
+        if isinstance(logit_final, nn.Linear):
+            nn.init.xavier_uniform_(logit_final.weight, gain=0.05)
+            nn.init.zeros_(logit_final.bias)
 
     def load_base_state_dict(self, state_dict: dict):
         """Load a local-only checkpoint into the frozen base policy."""
@@ -149,10 +160,28 @@ class PriceAdapterActorCritic(nn.Module):
             return
         self.base_policy.load_state_dict(state_dict)
 
+    def load_state_dict(self, state_dict: dict, strict: bool = True, assign: bool = False):
+        patched_state = dict(state_dict)
+        current_state = super().state_dict()
+        legacy_price_adapter = (
+            any(str(key).startswith("base_policy.") for key in patched_state)
+            and any(str(key).startswith("price_adapter.") for key in patched_state)
+            and not any(str(key).startswith("price_logit_adapter.") for key in patched_state)
+        )
+        if legacy_price_adapter:
+            for key, tensor in current_state.items():
+                if str(key).startswith("price_logit_adapter.") and key not in patched_state:
+                    patched_state[key] = tensor
+                    if str(key).startswith("price_logit_adapter.3."):
+                        patched_state[key] = torch.zeros_like(tensor)
+        return super().load_state_dict(patched_state, strict=strict, assign=assign)
+
     def configure_trainable(self, train_base_policy: bool, train_price_adapter: bool):
         for parameter in self.base_policy.parameters():
             parameter.requires_grad_(bool(train_base_policy))
         for parameter in self.price_adapter.parameters():
+            parameter.requires_grad_(bool(train_price_adapter))
+        for parameter in self.price_logit_adapter.parameters():
             parameter.requires_grad_(bool(train_price_adapter))
 
     def split_observation(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -172,6 +201,9 @@ class PriceAdapterActorCritic(nn.Module):
         if self.price_context_dim > 0:
             features = features + self.adapter_scale * self.price_adapter(price_obs)
         logits = self.base_policy.logits_head(self.base_policy.actor(features)).reshape(-1, self.act_dim, self.num_bins)
+        if self.price_context_dim > 0:
+            logit_bias = self.price_logit_adapter(price_obs).reshape(-1, self.act_dim, self.num_bins)
+            logits = logits + self.adapter_scale * logit_bias
         value = self.base_policy.critic(features).squeeze(-1)
         return self._apply_action_mask(logits, action_mask), value
 
