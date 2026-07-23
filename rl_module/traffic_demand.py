@@ -13,6 +13,7 @@ import os
 import random
 import re
 import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -208,14 +209,27 @@ def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime,
         # never receives a date that cannot produce edge data.
         day_offset = 0
         max_calendar_scan = max(366, target_episodes * 14)
-        while len(episodes) < target_episodes and day_offset < max_calendar_scan:
+        try:
+            first_year_end = settings.start_date.replace(year=settings.start_date.year + 1)
+        except ValueError:
+            first_year_end = settings.start_date + timedelta(days=365)
+        preferred_calendar_scan = max(1, (first_year_end - settings.start_date).days)
+        while day_offset < max_calendar_scan:
             day = settings.start_date + timedelta(days=day_offset)
             if _matches_day_filter(day, settings.day_filter) and _has_traffic_rows(day):
                 for hour in settings.focus_hours:
                     episodes.append((day, int(hour)))
-                    if len(episodes) >= target_episodes:
+                    if not settings.shuffle_episode_schedule and len(episodes) >= target_episodes:
                         break
             day_offset += 1
+            if not settings.shuffle_episode_schedule and len(episodes) >= target_episodes:
+                break
+            if (
+                settings.shuffle_episode_schedule
+                and day_offset >= preferred_calendar_scan
+                and len(episodes) >= target_episodes
+            ):
+                break
         if len(episodes) < target_episodes:
             raise ValueError(
                 f"Could only build {len(episodes)} episodes after scanning {max_calendar_scan} calendar days. "
@@ -225,10 +239,29 @@ def build_episode_schedule(settings: ExperimentSettings) -> list[tuple[datetime,
     if not episodes:
         raise ValueError("Episode schedule is empty.")
     if settings.shuffle_episode_schedule:
-        # Shuffling avoids presenting all 07:00/08:00 episodes in a fixed pattern.
+        # Shuffling samples the requested episode count from the full scanned
+        # calendar pool while preserving the requested focus-hour balance, then
+        # avoids presenting focus hours in a fixed pattern.
         rng = random.Random(settings.global_seed)
+        candidate_days = []
+        seen_days = set()
+        for day, _hour in episodes:
+            day_key = day.strftime("%Y-%m-%d")
+            if day_key in seen_days:
+                continue
+            seen_days.add(day_key)
+            candidate_days.append(day)
+        rng.shuffle(candidate_days)
+        episodes = []
+        for day in candidate_days:
+            for hour in settings.focus_hours:
+                episodes.append((day, int(hour)))
+                if len(episodes) >= target_episodes:
+                    break
+            if len(episodes) >= target_episodes:
+                break
         rng.shuffle(episodes)
-    return episodes
+    return episodes[:target_episodes]
 
 
 def sample_demand_noise(settings: DemandSettings, global_seed: int, episode_idx: int, simulation_date: str, hour: int) -> float:
@@ -368,12 +401,16 @@ def build_route_cache_folder(
 
 
 def route_files_ready(route_folder_path: str) -> bool:
-    """Return True when the required SUMO route files exist."""
+    """Return True when the required SUMO route files exist and generated routes are valid XML."""
 
-    return all(
-        os.path.exists(os.path.join(route_folder_path, name))
-        for name in ("randomTrips.rou.xml", "trips.rou.xml", "generatedRoutes.rou.xml")
-    )
+    required = ("randomTrips.rou.xml", "trips.rou.xml", "generatedRoutes.rou.xml")
+    if not all(os.path.exists(os.path.join(route_folder_path, name)) for name in required):
+        return False
+    try:
+        ET.parse(os.path.join(route_folder_path, "generatedRoutes.rou.xml"))
+    except ET.ParseError:
+        return False
+    return True
 
 
 def ensure_routes(episode: EpisodeDemand, planner, demand: DemandSettings) -> tuple[str, bool]:
@@ -382,6 +419,9 @@ def ensure_routes(episode: EpisodeDemand, planner, demand: DemandSettings) -> tu
     os.makedirs(os.path.join(episode.route_folder_path, "output"), exist_ok=True)
     if demand.reuse_cached_routes and route_files_ready(episode.route_folder_path):
         return episode.route_folder_path, False
+    generated_routes_path = os.path.join(episode.route_folder_path, "generatedRoutes.rou.xml")
+    if os.path.exists(generated_routes_path):
+        os.remove(generated_routes_path)
     traffic_flow_file_path = episode.traffic_flow_file_path or resolve_traffic_flow_file_for_year(
         int(str(episode.simulation_date).split("-", maxsplit=1)[0])
     )
@@ -396,6 +436,7 @@ def ensure_routes(episode: EpisodeDemand, planner, demand: DemandSettings) -> tu
         routeSamplerSeed=episode.route_sampler_seed,
         routeSamplerThreads=demand.route_sampler_threads,
     )
+    ET.parse(generated_routes_path)
     return episode.route_folder_path, True
 
 

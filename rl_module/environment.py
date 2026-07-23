@@ -1450,34 +1450,54 @@ class LocalTazTrafficEnv(EnvBase):
         }
 
     def _parse_emission_metric(self, emission_path: str, metric: str) -> dict:
+        return self._parse_emission_metrics(emission_path, (metric,))[metric]
+
+    def _parse_emission_metrics(self, emission_path: str, metrics: tuple[str, ...]) -> dict[str, dict]:
+        """Stream SUMO emission totals without loading the potentially multi-GB XML into RAM."""
+
+        results = {
+            metric: {"total_emission": 0.0, "ok": False}
+            for metric in metrics
+        }
         if not os.path.exists(emission_path):
-            return {"total_emission": 0.0, "ok": False}
+            return results
 
-        root = self._safe_parse_xml_root(emission_path)
-        if root is None:
-            return {"total_emission": 0.0, "ok": False}
+        totals = {metric: 0.0 for metric in metrics}
+        timestep_count = 0
+        timestep_has_vehicle = False
+        try:
+            for event, elem in ET.iterparse(emission_path, events=("start", "end")):
+                tag = str(elem.tag).rsplit("}", 1)[-1]
+                if event == "start" and tag == "timestep":
+                    timestep_has_vehicle = False
+                    continue
+                if event != "end":
+                    continue
+                if tag == "vehicle":
+                    timestep_has_vehicle = True
+                    for metric in metrics:
+                        totals[metric] += self._safe_float(
+                            self._get_attr_case_insensitive(elem, metric),
+                            0.0,
+                        )
+                    elem.clear()
+                elif tag == "timestep":
+                    timestep_count += 1
+                    if not timestep_has_vehicle:
+                        for metric in metrics:
+                            totals[metric] += self._safe_float(
+                                self._get_attr_case_insensitive(elem, metric),
+                                0.0,
+                            )
+                    elem.clear()
+        except (ET.ParseError, OSError):
+            return results
 
-        totals = []
-        for timestep in root.findall("timestep"):
-            vehicles = timestep.findall("vehicle")
-            if vehicles:
-                totals.append(
-                    sum(
-                        self._safe_float(self._get_attr_case_insensitive(vehicle, metric), 0.0)
-                        for vehicle in vehicles
-                    )
-                )
-                continue
-
-            total_attr = self._get_attr_case_insensitive(timestep, metric)
-            totals.append(self._safe_float(total_attr, 0.0))
-
-        if not totals:
-            return {"total_emission": 0.0, "ok": False}
-
+        if timestep_count <= 0:
+            return results
         return {
-            "total_emission": float(sum(totals)),
-            "ok": True,
+            metric: {"total_emission": float(totals[metric]), "ok": True}
+            for metric in metrics
         }
 
     def _normalize_metric(self, value: float, ref: float) -> float:
@@ -1519,8 +1539,9 @@ class LocalTazTrafficEnv(EnvBase):
         tripinfo_path = os.path.join(output_dir, self.tripinfo_filename)
         emission_path = os.path.join(output_dir, self.emission_filename)
         waiting = self._get_episode_waiting_metrics()
-        co2 = self._parse_emission_metric(emission_path, "CO2")
-        nox = self._parse_emission_metric(emission_path, "NOx")
+        emissions = self._parse_emission_metrics(emission_path, ("CO2", "NOx"))
+        co2 = emissions["CO2"]
+        nox = emissions["NOx"]
         waiting_ok = bool(waiting["vehicle_count"] > 0)
         parse_ok = bool(waiting_ok and co2["ok"] and nox["ok"])
         if not parse_ok:

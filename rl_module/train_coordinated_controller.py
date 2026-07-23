@@ -26,6 +26,7 @@ from rl_module.checkpoints import (
     checkpoint_score_from_reference,
     load_local_controller_weights,
     resume_coordinated_checkpoint,
+    rolling_checkpoint_score,
     write_history_header,
 )
 from rl_module.coordination import (
@@ -56,8 +57,10 @@ from rl_module.traffic_demand import cleanup_sumo_output_files, build_episode_sc
 
 LOAD_COORDINATED_CHECKPOINT = False
 COORDINATED_CHECKPOINT_PATH = os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_best.pt")
-RESUME_FROM_CHECKPOINT_EPISODE = True
+RESUME_FROM_CHECKPOINT_EPISODE = False
 START_EPISODE_OVERRIDE = None
+CHECKPOINT_SCORE_WINDOW = 10
+CHECKPOINT_MIN_PROMOTION_EPISODES = 5
 
 
 def _global_context_tensor(episode, reference_penalty: float | None, device: torch.device) -> torch.Tensor:
@@ -369,7 +372,7 @@ def main():
     coordinator_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         coordinator_optimizer, mode="max", factor=0.7, patience=15, threshold=0.005, threshold_mode="rel", min_lr=1e-5
     )
-    start_episode = resume_coordinated_checkpoint(
+    start_episode, resumed_best = resume_coordinated_checkpoint(
         checkpoint_path=COORDINATED_CHECKPOINT_PATH,
         enabled=LOAD_COORDINATED_CHECKPOINT,
         resume_episode=RESUME_FROM_CHECKPOINT_EPISODE,
@@ -394,7 +397,8 @@ def main():
         "terminal_penalty", "baseline_penalty", "delta_penalty_vs_baseline", "local_reference_penalty",
         "delta_penalty_vs_local_reference", "coordination_reference_mode", "coordination_reference_label",
         "coordination_reference_penalty",
-        "checkpoint_score", "checkpoint_score_metric", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
+        "checkpoint_score", "checkpoint_score_metric", "checkpoint_selection_score", "checkpoint_selection_metric",
+        "checkpoint_selection_window", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
         "coordination_adjustment_mean", "coordinator_reward_mean", "coordinator_price_mean",
         "coordinator_price_std", "mean_emission_penalty", "max_emission_penalty",
         "mean_emission_delta", "total_emission_delta", "worst_taz_worsening",
@@ -414,6 +418,17 @@ def main():
     best_delta_penalty_vs_baseline = None
     best_delta_penalty_vs_local_reference = None
     best_episode = -1
+    if resumed_best:
+        if resumed_best["best_checkpoint_score"] is not None:
+            best_checkpoint_score = float(resumed_best["best_checkpoint_score"])
+        best_checkpoint_metric = resumed_best["best_checkpoint_metric"]
+        if resumed_best["best_terminal_penalty"] is not None:
+            best_terminal_penalty = float(resumed_best["best_terminal_penalty"])
+        best_baseline_penalty = resumed_best["best_baseline_penalty"]
+        best_local_reference_penalty = resumed_best["best_local_reference_penalty"]
+        best_delta_penalty_vs_baseline = resumed_best["best_delta_penalty_vs_baseline"]
+        best_delta_penalty_vs_local_reference = resumed_best["best_delta_penalty_vs_local_reference"]
+        best_episode = int(resumed_best["best_episode"])
     last_completed_episode = start_episode - 1
     interrupted = False
 
@@ -441,6 +456,9 @@ def main():
         )
         route_folder_path, generated = ensure_routes(episode, planner, DEMAND)
         print(f"[ROUTES] {'generated' if generated else 'cached'} | {route_folder_path}")
+        stale_output_cleanup = cleanup_sumo_output_files(route_folder_path)
+        if stale_output_cleanup["errors"]:
+            print(f"[WARN] SUMO stale output cleanup errors: {stale_output_cleanup['errors'][:3]}")
 
         baseline_penalty, baseline_components, baseline_ran = _ensure_baseline_reference(
             env=env,
@@ -729,6 +747,14 @@ def main():
             "route_sampler_seed": int(episode.route_sampler_seed),
             "route_folder_path": route_folder_path,
         }
+        checkpoint_selection_score, checkpoint_selection_metric, checkpoint_selection_window = rolling_checkpoint_score(
+            [*history, row],
+            window_size=CHECKPOINT_SCORE_WINDOW,
+            min_count=CHECKPOINT_MIN_PROMOTION_EPISODES,
+        )
+        row["checkpoint_selection_score"] = checkpoint_selection_score if checkpoint_selection_score is not None else ""
+        row["checkpoint_selection_metric"] = checkpoint_selection_metric or ""
+        row["checkpoint_selection_window"] = int(checkpoint_selection_window)
         append_history(row, EXPERIMENT.history_csv_path, EXPERIMENT.history_json_path, csv_cols, history)
 
         detail_payload = {
@@ -779,6 +805,9 @@ def main():
             "best_delta_penalty_vs_local_reference": best_delta_penalty_vs_local_reference,
             "checkpoint_score_metric": checkpoint_metric,
             "checkpoint_score": checkpoint_score,
+            "checkpoint_selection_metric": checkpoint_selection_metric,
+            "checkpoint_selection_score": checkpoint_selection_score,
+            "checkpoint_selection_window": int(checkpoint_selection_window),
             "baseline_penalty": baseline_penalty,
             "delta_penalty_vs_baseline": delta_penalty_vs_baseline,
             "local_reference_penalty": local_reference_penalty,
@@ -786,9 +815,9 @@ def main():
             "coordination_reference_penalty": coordination_reference_penalty,
         }
         _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, f"coordinated_controller_episode{episode_idx}.pt"), checkpoint_payload)
-        if checkpoint_score is not None and checkpoint_score < best_checkpoint_score:
-            best_checkpoint_score = float(checkpoint_score)
-            best_checkpoint_metric = checkpoint_metric
+        if checkpoint_selection_score is not None and checkpoint_selection_score < best_checkpoint_score:
+            best_checkpoint_score = float(checkpoint_selection_score)
+            best_checkpoint_metric = checkpoint_selection_metric
             best_terminal_penalty = float(terminal_penalty) if terminal_penalty is not None else float("inf")
             best_baseline_penalty = baseline_penalty if baseline_penalty is not None else None
             best_local_reference_penalty = local_reference_penalty if local_reference_penalty is not None else None
@@ -812,6 +841,9 @@ def main():
             best_payload["best_local_reference_penalty"] = best_local_reference_penalty
             best_payload["best_delta_penalty_vs_baseline"] = best_delta_penalty_vs_baseline
             best_payload["best_delta_penalty_vs_local_reference"] = best_delta_penalty_vs_local_reference
+            best_payload["checkpoint_selection_metric"] = checkpoint_selection_metric
+            best_payload["checkpoint_selection_score"] = checkpoint_selection_score
+            best_payload["checkpoint_selection_window"] = int(checkpoint_selection_window)
             best_payload["policy_stage"] = "pre_update_rollout_policy"
             _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_best.pt"), best_payload)
         output_cleanup = cleanup_sumo_output_files(route_folder_path)

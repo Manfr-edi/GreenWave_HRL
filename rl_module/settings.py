@@ -27,13 +27,13 @@ class ExperimentSettings:
     start_date: datetime = datetime(2025, 1, 1)
     # This is the target number of training episodes, not a calendar-day window.
     train_days: int = 200
-    focus_hours: tuple[int, ...] = (7, 8)
+    focus_hours: tuple[int, ...] = (8, 17)
     # focus_hours: tuple[int, ...] = (7, 8)
     # Supported values: all, weekdays, weekends, or explicit weekdays like "mon-wed-sat".
     day_filter: str = "weekdays"
     # day_filter: str = "mon-wed-sat"
     train_on_same_day: bool = False
-    shuffle_episode_schedule: bool = False
+    shuffle_episode_schedule: bool = True
     global_seed: int = 42
     selected_taz_id: str | None = None
 
@@ -60,7 +60,7 @@ class ExperimentSettings:
 class DemandSettings:
     """Demand profile and deterministic randomization rules."""
 
-    base_demand: int = 3000
+    base_demand: int = 1000
     hourly_profile: dict[int, float] = field(default_factory=lambda: {
         0: 0.2, 1: 0.15, 2: 0.1, 3: 0.1, 4: 0.2,
         5: 0.4, 6: 0.7, 7: 1.2, 8: 1.5,
@@ -87,9 +87,9 @@ class DemandSettings:
     random_trip_seed: int = 42
     route_sampler_seed: int = 42
     route_sampler_threads: int = 1
-    # Keep False for now because the user asked not to change the seed; demand noise
-    # and deterministic schedule shuffling already make scenarios less repetitive.
-    vary_route_seeds_by_episode: bool = False
+    # Vary route generation while keeping the run deterministic from global_seed
+    # and episode metadata.
+    vary_route_seeds_by_episode: bool = True
 
 
 @dataclass(frozen=True)
@@ -100,9 +100,9 @@ class EnvironmentSettings:
     jam_norm: float = 10.0
     warmupSteps: int = 0
     cooldownSteps: int = 12
-    min_green: int = 25
-    max_green: int = 120
-    metric_clip: float = 2.0
+    min_green: int = 20
+    max_green: int = 90
+    metric_clip: float = 4.0
     reward_clip: float = 4.0
     dense_abs_penalty_weight: float = 1.0
     dense_delta_reward_weight: float = 0.15
@@ -165,12 +165,12 @@ class LocalControllerSettings:
     ppo_epochs: int = 4
     minibatch_size: int = 64
     load_pretrained: bool = True
-    pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "checkpoints", "local_controller", "local_controller_episode59.pt")
+    pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "checkpoints", "local_controller", "local_controller_best.pt")
     # pretrained_checkpoint_path: str = os.path.join(PACKAGE_DIR, "saved_trainings", "weekends_7_8", "checkpoints", "local_controller", "local_controller_best.pt")
     # In the coordinated stage the pretrained local policy should remain the
     # behavioral reference. The coordinator learns through a small price adapter.
-    train_local_policy: bool = True
-    train_price_adapter: bool = False
+    train_local_policy: bool = False
+    train_price_adapter: bool = True
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,7 @@ import calendar
 import csv
 import json
 import os
+import random
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -157,6 +158,7 @@ SUPPORT_COLORS = {
     "local_greedy": "#2a9d8f",
     "coordinated_greedy": "#e76f51",
 }
+EVALUATION_METRIC_SCHEMA_VERSION = 2
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -278,26 +280,41 @@ def _parse_emission_output_by_taz(
     taz_polygons: dict[str, list[tuple[float, float]]] | None,
 ) -> dict:
     emissions_by_taz = _empty_emissions_by_taz(taz_ids)
+    network_totals = {metric_name: 0.0 for metric_name in EMISSION_OUTPUT_ATTRS}
     taz_lookup = _prepare_taz_lookup(taz_ids, taz_polygons)
-    if not emission_output_path or not os.path.exists(emission_output_path) or not taz_lookup:
+    if not emission_output_path or not os.path.exists(emission_output_path):
         return {
             "emissions_by_taz": emissions_by_taz,
+            "network_totals": network_totals,
+            "network_sample_count": 0,
             "assigned_sample_count": 0,
             "unassigned_sample_count": 0,
+            "network_ok": False,
             "ok": False,
             "path": emission_output_path,
             "source": "emission_output_xy_polygon",
         }
 
+    network_sample_count = 0
     assigned_sample_count = 0
     unassigned_sample_count = 0
+    timestep_has_vehicle = False
     try:
-        for _, elem in ET.iterparse(emission_output_path, events=("end",)):
+        for event, elem in ET.iterparse(emission_output_path, events=("start", "end")):
             tag = _xml_local_name(elem.tag)
+            if event == "start" and tag == "timestep":
+                timestep_has_vehicle = False
+                continue
+            if event != "end":
+                continue
             if tag == "vehicle":
+                timestep_has_vehicle = True
+                for metric_name, attr_name in EMISSION_OUTPUT_ATTRS.items():
+                    network_totals[metric_name] += _safe_float(elem.get(attr_name), 0.0)
+                network_sample_count += 1
                 x_raw = elem.get("x")
                 y_raw = elem.get("y")
-                if x_raw is None or y_raw is None:
+                if x_raw is None or y_raw is None or not taz_lookup:
                     unassigned_sample_count += 1
                     elem.clear()
                     continue
@@ -322,12 +339,19 @@ def _parse_emission_output_by_taz(
                 assigned_sample_count += 1
                 elem.clear()
             elif tag == "timestep":
+                if not timestep_has_vehicle:
+                    for metric_name, attr_name in EMISSION_OUTPUT_ATTRS.items():
+                        network_totals[metric_name] += _safe_float(elem.get(attr_name), 0.0)
+                    network_sample_count += 1
                 elem.clear()
     except Exception:
         return {
             "emissions_by_taz": emissions_by_taz,
+            "network_totals": {metric_name: float(value) for metric_name, value in network_totals.items()},
+            "network_sample_count": int(network_sample_count),
             "assigned_sample_count": int(assigned_sample_count),
             "unassigned_sample_count": int(unassigned_sample_count),
+            "network_ok": False,
             "ok": False,
             "path": emission_output_path,
             "source": "emission_output_xy_polygon",
@@ -335,8 +359,11 @@ def _parse_emission_output_by_taz(
 
     return {
         "emissions_by_taz": emissions_by_taz,
+        "network_totals": {metric_name: float(value) for metric_name, value in network_totals.items()},
+        "network_sample_count": int(network_sample_count),
         "assigned_sample_count": int(assigned_sample_count),
         "unassigned_sample_count": int(unassigned_sample_count),
+        "network_ok": bool(network_sample_count > 0),
         "ok": bool(assigned_sample_count > 0),
         "path": emission_output_path,
         "source": "emission_output_xy_polygon",
@@ -412,33 +439,44 @@ def _collect_run_metrics(
     waiting = dict(waiting_components or {})
     tripinfo_path = str(waiting.get("tripinfo_path") or os.path.join(output_dir, "tripinfos.xml"))
     emission_output_path = os.path.join(output_dir, "emission-output.xml")
-    emissions = _parse_tripinfo_emission_totals(tripinfo_path)
+    completed_trip_emissions = _parse_tripinfo_emission_totals(tripinfo_path)
     emissions_by_taz_payload = _parse_emission_output_by_taz(emission_output_path, taz_ids, taz_polygons)
     emission_taz_summary = _summarize_emissions_by_taz(emissions_by_taz_payload["emissions_by_taz"], taz_ids)
+    trip_count = int(waiting.get("trip_count", 0))
+    completed_trip_count = int(completed_trip_emissions["tripinfo_count"])
     return {
-        "trip_count": int(waiting.get("trip_count", 0)),
-        "tripinfo_count": int(emissions["tripinfo_count"]),
-        "emission_trip_count": int(emissions["emission_trip_count"]),
+        "trip_count": trip_count,
+        "tripinfo_count": completed_trip_count,
+        "completed_trip_count": completed_trip_count,
+        "completed_trip_rate": float(completed_trip_count / trip_count) if trip_count > 0 else None,
+        "emission_trip_count": int(completed_trip_emissions["emission_trip_count"]),
         "avg_waiting_time": float(waiting.get("avg_waiting_time", 0.0)),
         "total_waiting_time": float(waiting.get("total_waiting_time", 0.0)),
         "waiting_metric_source": str(waiting.get("waiting_metric_source", "unknown")),
-        "emission_metric_source": "tripinfo_emissions_abs",
+        "emission_metric_source": "emission_output_all_vehicle_samples",
+        "completed_trip_emission_metric_source": "tripinfo_emissions_abs",
         "emission_taz_metric_source": emissions_by_taz_payload["source"],
         "waiting_time_by_taz": dict(waiting.get("waiting_time_by_taz", {}) or {}),
         "vehicle_count_by_taz": dict(waiting.get("vehicle_count_by_taz", {}) or {}),
         "emissions_by_taz": emissions_by_taz_payload["emissions_by_taz"],
         "emission_taz_summary": emission_taz_summary,
         "emission_taz_parse_ok": bool(emissions_by_taz_payload["ok"]),
+        "emission_network_parse_ok": bool(emissions_by_taz_payload["network_ok"]),
+        "emission_network_sample_count": int(emissions_by_taz_payload["network_sample_count"]),
         "emission_assigned_sample_count": int(emissions_by_taz_payload["assigned_sample_count"]),
         "emission_unassigned_sample_count": int(emissions_by_taz_payload["unassigned_sample_count"]),
         **_co2_taz_aliases(emission_taz_summary),
-        "total_co2": float(emissions["total_co2"]),
-        "total_nox": float(emissions["total_nox"]),
-        "total_fuel": float(emissions["total_fuel"]),
-        "total_co": float(emissions["total_co"]),
-        "ok": bool(waiting.get("parse_ok", False) and emissions["ok"]),
+        **{
+            metric_name: float(emissions_by_taz_payload["network_totals"][metric_name])
+            for metric_name in EMISSION_OUTPUT_ATTRS
+        },
+        **{
+            f"completed_trip_{metric_name}": float(completed_trip_emissions[metric_name])
+            for metric_name in TRIPINFO_EMISSION_ATTRS
+        },
+        "ok": bool(waiting.get("parse_ok", False) and emissions_by_taz_payload["network_ok"]),
         "tripinfo_path": tripinfo_path,
-        "emission_path": tripinfo_path,
+        "emission_path": emission_output_path,
         "emission_output_path": emission_output_path,
     }
 
@@ -972,6 +1010,8 @@ def _aggregate_metrics(metrics_list: list[dict]) -> dict:
         "run_count": int(len(metrics_list)),
         "trip_count": _mean("trip_count"),
         "tripinfo_count": _mean("tripinfo_count"),
+        "completed_trip_count": _mean("completed_trip_count"),
+        "completed_trip_rate": _mean_optional("completed_trip_rate"),
         "emission_trip_count": _mean("emission_trip_count"),
         "avg_waiting_time": _mean("avg_waiting_time"),
         "total_waiting_time": _mean("total_waiting_time"),
@@ -979,9 +1019,15 @@ def _aggregate_metrics(metrics_list: list[dict]) -> dict:
         "total_nox": _mean("total_nox"),
         "total_fuel": _mean("total_fuel"),
         "total_co": _mean("total_co"),
+        "completed_trip_total_co2": _mean("completed_trip_total_co2"),
+        "completed_trip_total_nox": _mean("completed_trip_total_nox"),
+        "completed_trip_total_fuel": _mean("completed_trip_total_fuel"),
+        "completed_trip_total_co": _mean("completed_trip_total_co"),
         "emissions_by_taz": emissions_by_taz,
         "emission_taz_summary": emission_taz_summary,
         "emission_taz_parse_ok": bool(all(bool(metrics.get("emission_taz_parse_ok", False)) for metrics in metrics_list)),
+        "emission_network_parse_ok": bool(all(bool(metrics.get("emission_network_parse_ok", False)) for metrics in metrics_list)),
+        "emission_network_sample_count": _mean_optional("emission_network_sample_count"),
         "emission_assigned_sample_count": _mean_optional("emission_assigned_sample_count"),
         "emission_unassigned_sample_count": _mean_optional("emission_unassigned_sample_count"),
         **_co2_taz_aliases(emission_taz_summary),
@@ -1515,6 +1561,21 @@ def _build_validation_episodes(args) -> tuple[list[EpisodeDemand], dict]:
         if args.max_scenarios is not None and len(episodes) >= int(args.max_scenarios):
             break
 
+    if args.random_scenarios_per_timeslot is not None:
+        count = int(args.random_scenarios_per_timeslot)
+        rng = random.Random(int(args.random_seed))
+        sampled = []
+        for _, timeslot, _ in parsed_timeslots:
+            candidates = [episode for episode in episodes if episode.timeslot == timeslot]
+            if len(candidates) < count:
+                raise ValueError(
+                    f"Only {len(candidates)} valid scenarios are available for {timeslot}; "
+                    f"cannot sample {count} without replacement."
+                )
+            sampled.extend(rng.sample(candidates, count))
+        rng.shuffle(sampled)
+        episodes = sampled
+
     if not episodes:
         raise ValueError(
             "Validation scenario set is empty. Check date range, day filter, timeslots, and traffic-flow CSV coverage."
@@ -1530,6 +1591,8 @@ def _build_validation_episodes(args) -> tuple[list[EpisodeDemand], dict]:
         "timeslots": [slot for _, slot, _ in parsed_timeslots],
         "skipped_dates": skipped_dates,
         "max_scenarios": args.max_scenarios,
+        "random_scenarios_per_timeslot": args.random_scenarios_per_timeslot,
+        "random_seed": args.random_seed,
         "episode_index_start": int(args.episode_index),
         "traffic_flow_files_by_year": {
             str(year): path
@@ -1636,6 +1699,67 @@ def _selected_taz_ids_from_entries(*entry_maps: dict[str, dict]) -> list[str] | 
     return all_ids if len(all_ids) == 1 else None
 
 
+def _checkpoint_local_state_dict(checkpoint: dict) -> dict:
+    return checkpoint.get(
+        "local_controller_state_dict",
+        checkpoint.get("model_state_dict", checkpoint.get("local_model_state_dict", {})),
+    )
+
+
+def _audit_local_checkpoint_compatibility(local_checkpoint: dict, coordinated_checkpoint: dict) -> dict:
+    """Check whether local-vs-coordinated isolates the coordinator contribution."""
+
+    local_state = _checkpoint_local_state_dict(local_checkpoint)
+    coordinated_state = _checkpoint_local_state_dict(coordinated_checkpoint)
+    coordinated_policy_class = str(coordinated_checkpoint.get("local_policy_class", "MultiDiscreteActorCritic"))
+    prefix = "base_policy." if coordinated_policy_class == "PriceAdapterActorCritic" else ""
+    compared_tensor_count = 0
+    missing_tensor_keys = []
+    max_abs_difference = 0.0
+    for key, local_tensor in local_state.items():
+        coordinated_key = f"{prefix}{key}"
+        coordinated_tensor = coordinated_state.get(coordinated_key)
+        if coordinated_tensor is None or tuple(local_tensor.shape) != tuple(coordinated_tensor.shape):
+            missing_tensor_keys.append(coordinated_key)
+            continue
+        compared_tensor_count += 1
+        max_abs_difference = max(
+            max_abs_difference,
+            float((local_tensor.detach().cpu() - coordinated_tensor.detach().cpu()).abs().max().item()),
+        )
+
+    local_experiment = dict(local_checkpoint.get("experiment_settings", {}) or {})
+    coordinated_experiment = dict(coordinated_checkpoint.get("experiment_settings", {}) or {})
+    local_environment = dict(local_checkpoint.get("environment_settings", {}) or {})
+    coordinated_environment = dict(coordinated_checkpoint.get("environment_settings", {}) or {})
+    experiment_keys = ("focus_hours", "day_filter")
+    environment_keys = ("min_green", "max_green", "cooldownSteps")
+    experiment_mismatches = {
+        key: {"local": local_experiment.get(key), "coordinated": coordinated_experiment.get(key)}
+        for key in experiment_keys
+        if local_experiment.get(key) != coordinated_experiment.get(key)
+    }
+    environment_mismatches = {
+        key: {"local": local_environment.get(key), "coordinated": coordinated_environment.get(key)}
+        for key in environment_keys
+        if local_environment.get(key) != coordinated_environment.get(key)
+    }
+    same_base_weights = bool(compared_tensor_count > 0 and not missing_tensor_keys and max_abs_difference <= 1e-8)
+    metadata_compatible = bool(not experiment_mismatches and not environment_mismatches)
+    return {
+        "incremental_comparison_valid": bool(same_base_weights and metadata_compatible),
+        "same_local_base_weights": same_base_weights,
+        "max_abs_local_base_weight_difference": float(max_abs_difference),
+        "compared_tensor_count": int(compared_tensor_count),
+        "missing_tensor_keys": missing_tensor_keys,
+        "metadata_compatible": metadata_compatible,
+        "experiment_mismatches": experiment_mismatches,
+        "environment_mismatches": environment_mismatches,
+        "coordinated_local_policy_class": coordinated_policy_class,
+        "coordinated_training_local_settings": dict(coordinated_checkpoint.get("local_controller_settings", {}) or {}),
+    }
+
+
 def _add_local_bundles(entries: dict[str, dict], env: CoordinatedTazTrafficEnv) -> dict[str, dict]:
     for entry in entries.values():
         entry["bundle"] = _build_local_policy_bundle(entry["checkpoint"], env)
@@ -1650,6 +1774,79 @@ def _add_coordinated_bundles(
     for entry in entries.values():
         entry["bundle"] = _build_policy_bundle(entry["checkpoint"], env, adjacency_matrix)
     return entries
+
+
+def _episode_report_path(report_root: str, episode: EpisodeDemand) -> str:
+    return os.path.join(
+        os.path.abspath(report_root),
+        episode.simulation_date,
+        episode.timeslot_clean,
+        f"demand_{episode.vehicle_count}",
+        "comparison_coordinated_controller.json",
+    )
+
+
+def _without_stochastic_sections(report: dict) -> dict:
+    report = dict(report)
+    for key in (
+        "local_stochastic_runs",
+        "local_stochastic_mean",
+        "comparison_local_stochastic_mean",
+        "coordinated_stochastic_runs",
+        "coordinated_stochastic_mean",
+        "comparison_coordinated_stochastic_mean",
+        "comparison_coordinated_vs_local_stochastic_mean",
+    ):
+        report.pop(key, None)
+    return report
+
+
+def _load_resumable_report(
+    args,
+    episode: EpisodeDemand,
+    local_checkpoint_path: str | None,
+    coordinated_checkpoint_path: str | None,
+) -> dict | None:
+    report_path = _episode_report_path(args.report_root, episode)
+    if not os.path.exists(report_path):
+        return None
+    try:
+        with open(report_path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    expected_paths = {
+        "local_checkpoint_path": os.path.abspath(local_checkpoint_path) if local_checkpoint_path else None,
+        "coordinated_checkpoint_path": os.path.abspath(coordinated_checkpoint_path) if coordinated_checkpoint_path else None,
+    }
+    matches_identity = (
+        int(report.get("evaluation_metric_schema_version", 0)) == EVALUATION_METRIC_SCHEMA_VERSION
+        and report.get("date") == episode.simulation_date
+        and report.get("timeslot") == episode.timeslot
+        and int(report.get("episode_index", -1)) == int(episode.episode_idx)
+        and report.get("local_checkpoint_path") == expected_paths["local_checkpoint_path"]
+        and report.get("coordinated_checkpoint_path") == expected_paths["coordinated_checkpoint_path"]
+    )
+    if not matches_identity:
+        return None
+    if "baseline" not in report:
+        return None
+    if local_checkpoint_path and "local_greedy" not in report:
+        return None
+    if coordinated_checkpoint_path and "coordinated_greedy" not in report:
+        return None
+
+    requested_stochastic_runs = int(args.stochastic_runs)
+    if requested_stochastic_runs == 0:
+        return _without_stochastic_sections(report)
+
+    matches_stochastic = (
+        len(report.get("local_stochastic_runs", [])) == (requested_stochastic_runs if local_checkpoint_path else 0)
+        and len(report.get("coordinated_stochastic_runs", [])) == (requested_stochastic_runs if coordinated_checkpoint_path else 0)
+    )
+    return report if matches_stochastic else None
+
 
 
 def _run_single_evaluation(
@@ -1670,6 +1867,7 @@ def _run_single_evaluation(
     adjacency_metadata: dict,
     local_bundle: dict | None,
     coordinated_bundle: dict | None,
+    local_checkpoint_compatibility: dict | None,
 ) -> dict:
     report_dir = os.path.join(
         os.path.abspath(args.report_root),
@@ -1817,6 +2015,7 @@ def _run_single_evaluation(
         coordinated_stochastic_mean = _aggregate_metrics(coordinated_stochastic_runs)
 
     report = {
+        "evaluation_metric_schema_version": EVALUATION_METRIC_SCHEMA_VERSION,
         "date": episode.simulation_date,
         "timeslot": episode.timeslot,
         "episode_index": int(episode.episode_idx),
@@ -1840,6 +2039,7 @@ def _run_single_evaluation(
         "coordinator_obs_dim": int(coordinated_bundle["coordinator_obs_dim"]) if run_coordinated else None,
         "coordinated_local_obs_dim": int(coordinated_bundle["local_obs_dim"]) if run_coordinated else None,
         "local_only_obs_dim": int(local_bundle["local_obs_dim"]) if run_local else None,
+        "local_checkpoint_compatibility": local_checkpoint_compatibility if run_local and run_coordinated else None,
         "baseline": baseline_metrics,
     }
     if run_local:
@@ -1848,13 +2048,14 @@ def _run_single_evaluation(
             "local_stochastic_runs": local_stochastic_runs,
             "local_stochastic_mean": local_stochastic_mean,
             "comparison_local_greedy": _build_comparison(baseline_metrics, local_greedy_metrics, "baseline", "local_greedy"),
-            "comparison_local_stochastic_mean": _build_comparison(
+        })
+        if local_stochastic_mean is not None:
+            report["comparison_local_stochastic_mean"] = _build_comparison(
                 baseline_metrics,
                 local_stochastic_mean,
                 "baseline",
                 "local_stochastic_mean",
-            ),
-        })
+            )
     if run_coordinated:
         report.update({
             "coordinated_greedy": coordinated_greedy_metrics,
@@ -1866,13 +2067,14 @@ def _run_single_evaluation(
                 "baseline",
                 "coordinated_greedy",
             ),
-            "comparison_coordinated_stochastic_mean": _build_comparison(
+        })
+        if coordinated_stochastic_mean is not None:
+            report["comparison_coordinated_stochastic_mean"] = _build_comparison(
                 baseline_metrics,
                 coordinated_stochastic_mean,
                 "baseline",
                 "coordinated_stochastic_mean",
-            ),
-        })
+            )
     if run_local and run_coordinated:
         report.update({
             "comparison_coordinated_vs_local_greedy": _build_comparison(
@@ -1881,13 +2083,14 @@ def _run_single_evaluation(
                 "local_greedy",
                 "coordinated_greedy",
             ),
-            "comparison_coordinated_vs_local_stochastic_mean": _build_comparison(
+        })
+        if local_stochastic_mean is not None and coordinated_stochastic_mean is not None:
+            report["comparison_coordinated_vs_local_stochastic_mean"] = _build_comparison(
                 local_stochastic_mean,
                 coordinated_stochastic_mean,
                 "local_stochastic_mean",
                 "coordinated_stochastic_mean",
-            ),
-        })
+            )
     report["support_plots"] = _save_support_plots(report, report_dir)
     report_path = os.path.join(report_dir, "comparison_coordinated_controller.json")
     report["report_path"] = report_path
@@ -1986,6 +2189,7 @@ def _build_validation_summary(reports: list[dict], metadata: dict, args, output_
         if report.get("coordinated_checkpoint_path")
     }
     aggregate = {
+        "evaluation_metric_schema_version": EVALUATION_METRIC_SCHEMA_VERSION,
         "architecture_name": "validation_aggregate_baseline_vs_local_vs_coordinated",
         "validation": {
             **metadata,
@@ -1996,6 +2200,11 @@ def _build_validation_summary(reports: list[dict], metadata: dict, args, output_
         },
         "local_checkpoint_paths_by_day_type": local_paths_by_day_type,
         "coordinated_checkpoint_paths_by_day_type": coordinated_paths_by_day_type,
+        "local_checkpoint_compatibility_by_day_type": {
+            str((report.get("episode_demand", {}) or {}).get("day_type")): report.get("local_checkpoint_compatibility")
+            for report in reports
+            if report.get("local_checkpoint_compatibility")
+        },
         "scenario_reports": [
             {
                 "date": report.get("date"),
@@ -2108,14 +2317,23 @@ def _write_validation_csv(reports: list[dict], csv_path: str):
         "baseline_avg_waiting_time",
         "baseline_total_waiting_time",
         "baseline_total_co2",
+        "baseline_completed_trip_total_co2",
+        "baseline_completed_trip_count",
+        "baseline_co2_mean_per_active_taz",
         "baseline_total_nox",
         "local_greedy_avg_waiting_time",
         "local_greedy_total_waiting_time",
         "local_greedy_total_co2",
+        "local_greedy_completed_trip_total_co2",
+        "local_greedy_completed_trip_count",
+        "local_greedy_co2_mean_per_active_taz",
         "local_greedy_total_nox",
         "coordinated_greedy_avg_waiting_time",
         "coordinated_greedy_total_waiting_time",
         "coordinated_greedy_total_co2",
+        "coordinated_greedy_completed_trip_total_co2",
+        "coordinated_greedy_completed_trip_count",
+        "coordinated_greedy_co2_mean_per_active_taz",
         "coordinated_greedy_total_nox",
         "local_greedy_co2_improvement_pct",
         "coordinated_greedy_co2_improvement_pct",
@@ -2140,14 +2358,43 @@ def _write_validation_csv(reports: list[dict], csv_path: str):
                 "baseline_avg_waiting_time": _metric_value(report, "baseline", "avg_waiting_time"),
                 "baseline_total_waiting_time": _metric_value(report, "baseline", "total_waiting_time"),
                 "baseline_total_co2": _metric_value(report, "baseline", "total_co2"),
+                "baseline_completed_trip_total_co2": _metric_value(report, "baseline", "completed_trip_total_co2"),
+                "baseline_completed_trip_count": _metric_value(report, "baseline", "completed_trip_count"),
+                "baseline_co2_mean_per_active_taz": _metric_value(report, "baseline", "co2_mean_per_active_taz"),
                 "baseline_total_nox": _metric_value(report, "baseline", "total_nox"),
                 "local_greedy_avg_waiting_time": _metric_value(report, "local_greedy", "avg_waiting_time"),
                 "local_greedy_total_waiting_time": _metric_value(report, "local_greedy", "total_waiting_time"),
                 "local_greedy_total_co2": _metric_value(report, "local_greedy", "total_co2"),
+                "local_greedy_completed_trip_total_co2": _metric_value(
+                    report,
+                    "local_greedy",
+                    "completed_trip_total_co2",
+                ),
+                "local_greedy_completed_trip_count": _metric_value(report, "local_greedy", "completed_trip_count"),
+                "local_greedy_co2_mean_per_active_taz": _metric_value(
+                    report,
+                    "local_greedy",
+                    "co2_mean_per_active_taz",
+                ),
                 "local_greedy_total_nox": _metric_value(report, "local_greedy", "total_nox"),
                 "coordinated_greedy_avg_waiting_time": _metric_value(report, "coordinated_greedy", "avg_waiting_time"),
                 "coordinated_greedy_total_waiting_time": _metric_value(report, "coordinated_greedy", "total_waiting_time"),
                 "coordinated_greedy_total_co2": _metric_value(report, "coordinated_greedy", "total_co2"),
+                "coordinated_greedy_completed_trip_total_co2": _metric_value(
+                    report,
+                    "coordinated_greedy",
+                    "completed_trip_total_co2",
+                ),
+                "coordinated_greedy_completed_trip_count": _metric_value(
+                    report,
+                    "coordinated_greedy",
+                    "completed_trip_count",
+                ),
+                "coordinated_greedy_co2_mean_per_active_taz": _metric_value(
+                    report,
+                    "coordinated_greedy",
+                    "co2_mean_per_active_taz",
+                ),
                 "coordinated_greedy_total_nox": _metric_value(report, "coordinated_greedy", "total_nox"),
                 "local_greedy_co2_improvement_pct": _comparison_value(report, "comparison_local_greedy", "total_co2"),
                 "coordinated_greedy_co2_improvement_pct": _comparison_value(report, "comparison_coordinated_greedy", "total_co2"),
@@ -2198,6 +2445,13 @@ def main():
     parser.add_argument("--timeslots", default=None, help="Comma-separated full-hour slots for validation ranges.")
     parser.add_argument("--day-filter", default="all", help="Validation day filter: all, weekdays, weekends, or explicit weekdays.")
     parser.add_argument("--max-scenarios", type=int, default=None, help="Optional cap for validation smoke runs.")
+    parser.add_argument(
+        "--random-scenarios-per-timeslot",
+        type=int,
+        default=None,
+        help="Randomly sample this many valid dates for each timeslot, without replacement.",
+    )
+    parser.add_argument("--random-seed", type=int, default=42, help="Seed used to sample validation scenarios.")
     parser.add_argument("--validation-name", default=None, help="Optional folder name for the aggregate validation report.")
     parser.add_argument(
         "--checkpoint-mode",
@@ -2218,12 +2472,17 @@ def main():
     parser.add_argument("--skip-local", action="store_true", help="Skip local-only controller evaluation.")
     parser.add_argument("--skip-coordinated", action="store_true", help="Skip coordinated-controller evaluation.")
     parser.add_argument("--keep-raw-output", action="store_true", help="Keep bulky SUMO XML output files in report run folders.")
+    parser.add_argument("--resume", action="store_true", help="Reuse completed scenario reports and continue an interrupted batch.")
     args = parser.parse_args()
 
-    if args.stochastic_runs < 1:
-        raise ValueError("--stochastic-runs must be >= 1")
+    if args.stochastic_runs < 0:
+        raise ValueError("--stochastic-runs must be >= 0")
     if args.max_scenarios is not None and args.max_scenarios < 1:
         raise ValueError("--max-scenarios must be >= 1")
+    if args.random_scenarios_per_timeslot is not None and args.random_scenarios_per_timeslot < 1:
+        raise ValueError("--random-scenarios-per-timeslot must be >= 1")
+    if args.max_scenarios is not None and args.random_scenarios_per_timeslot is not None:
+        raise ValueError("Use either --max-scenarios or --random-scenarios-per-timeslot, not both.")
     if not _is_batch_mode(args) and (not args.date or not args.timeslot):
         raise ValueError("Single-scenario mode requires --date and --timeslot.")
 
@@ -2277,11 +2536,45 @@ def main():
         if run_coordinated:
             coordinated_checkpoint_entries = _add_coordinated_bundles(coordinated_checkpoint_entries, env, adjacency_matrix)
 
+        local_checkpoint_compatibility = {}
+        if run_local and run_coordinated:
+            for day_type in required_day_types:
+                local_entry = local_checkpoint_entries.get(day_type)
+                coordinated_entry = coordinated_checkpoint_entries.get(day_type)
+                if local_entry is None or coordinated_entry is None:
+                    continue
+                audit = _audit_local_checkpoint_compatibility(
+                    local_entry["checkpoint"],
+                    coordinated_entry["checkpoint"],
+                )
+                local_checkpoint_compatibility[day_type] = audit
+                if not audit["incremental_comparison_valid"]:
+                    print(
+                        "[WARN] Local-vs-coordinated does not isolate the coordinator contribution for "
+                        f"{day_type}: same_base={audit['same_local_base_weights']} | "
+                        f"metadata_compatible={audit['metadata_compatible']} | "
+                        f"max_base_weight_diff={audit['max_abs_local_base_weight_difference']:.6g}"
+                    )
+
         reports = []
         total = len(episodes)
         for index, episode in enumerate(episodes, start=1):
             local_entry = local_checkpoint_entries.get(episode.day_type) if run_local else None
             coordinated_entry = coordinated_checkpoint_entries.get(episode.day_type) if run_coordinated else None
+            if args.resume:
+                resumed_report = _load_resumable_report(
+                    args,
+                    episode,
+                    local_entry["path"] if local_entry else None,
+                    coordinated_entry["path"] if coordinated_entry else None,
+                )
+                if resumed_report is not None:
+                    reports.append(resumed_report)
+                    print(
+                        f"\n[SCENARIO {index}/{total}] RESUMED | date={episode.simulation_date} "
+                        f"timeslot={episode.timeslot} day_type={episode.day_type}"
+                    )
+                    continue
             print(
                 f"\n[SCENARIO {index}/{total}] date={episode.simulation_date} "
                 f"timeslot={episode.timeslot} day_type={episode.day_type} vehicles={episode.vehicle_count}"
@@ -2305,6 +2598,7 @@ def main():
                     adjacency_metadata=adjacency_metadata,
                     local_bundle=local_entry["bundle"] if local_entry else None,
                     coordinated_bundle=coordinated_entry["bundle"] if coordinated_entry else None,
+                    local_checkpoint_compatibility=local_checkpoint_compatibility.get(episode.day_type),
                 )
             )
 
