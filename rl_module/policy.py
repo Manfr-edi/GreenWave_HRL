@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """Policy networks shared by local and coordinator training.
 
 Both policies are multi-discrete actor-critics: the local controller predicts
 one action for each controllable TLS group, while the coordinator predicts one
 price-bin action for each TAZ.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -117,6 +117,7 @@ class PriceAdapterActorCritic(nn.Module):
         action_bins: tuple[float, ...],
         adapter_hidden_dim: int = 64,
         adapter_scale: float = 0.25,
+        adapter_mode: str = "legacy",
     ):
         super().__init__()
         self.base_obs_dim = int(base_obs_dim)
@@ -126,19 +127,40 @@ class PriceAdapterActorCritic(nn.Module):
         self.num_bins = int(len(action_bins))
         self.zero_action_index = int(action_bins.index(0.0))
         self.adapter_scale = float(adapter_scale)
+        self.adapter_mode = str(adapter_mode)
+        if self.adapter_mode not in ("legacy", "zero_anchored_v2"):
+            raise ValueError(
+                "adapter_mode must be 'legacy' or 'zero_anchored_v2', "
+                f"got {self.adapter_mode!r}"
+            )
         self.base_policy = MultiDiscreteActorCritic(self.base_obs_dim, self.act_dim, action_bins)
-        self.price_adapter = nn.Sequential(
-            nn.LayerNorm(self.price_context_dim),
-            nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
-            nn.GELU(),
-            nn.Linear(int(adapter_hidden_dim), 128),
-        )
-        self.price_logit_adapter = nn.Sequential(
-            nn.LayerNorm(self.price_context_dim),
-            nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
-            nn.GELU(),
-            nn.Linear(int(adapter_hidden_dim), self.act_dim * self.num_bins),
-        )
+        if self.adapter_mode == "legacy":
+            # Preserve the exact module layout expected by existing checkpoints.
+            self.price_adapter = nn.Sequential(
+                nn.LayerNorm(self.price_context_dim),
+                nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_hidden_dim), 128),
+            )
+            self.price_logit_adapter = nn.Sequential(
+                nn.LayerNorm(self.price_context_dim),
+                nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_hidden_dim), self.act_dim * self.num_bins),
+            )
+        else:
+            # LayerNorm on [own, neighbour, gap] removes the absolute price
+            # magnitude. The v2 adapter keeps that scale information.
+            self.price_adapter = nn.Sequential(
+                nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_hidden_dim), 128),
+            )
+            self.price_logit_adapter = nn.Sequential(
+                nn.Linear(self.price_context_dim, int(adapter_hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(adapter_hidden_dim), self.act_dim * self.num_bins),
+            )
         self.register_buffer("action_bins", torch.tensor(action_bins, dtype=torch.float32), persistent=False)
         self._reset_adapter()
 
@@ -149,7 +171,10 @@ class PriceAdapterActorCritic(nn.Module):
             nn.init.zeros_(final.bias)
         logit_final = self.price_logit_adapter[-1]
         if isinstance(logit_final, nn.Linear):
-            nn.init.xavier_uniform_(logit_final.weight, gain=0.05)
+            # A coordinated run must start as the pretrained local controller,
+            # including at zero price. The old random residual changed roughly
+            # half of the greedy actions before the first PPO update.
+            nn.init.zeros_(logit_final.weight)
             nn.init.zeros_(logit_final.bias)
 
     def load_base_state_dict(self, state_dict: dict):
@@ -195,14 +220,27 @@ class PriceAdapterActorCritic(nn.Module):
     def _apply_action_mask(self, logits: torch.Tensor, action_mask: torch.Tensor | None) -> torch.Tensor:
         return self.base_policy._apply_action_mask(logits, action_mask)
 
+    def _price_residual(self, adapter: nn.Module, price_obs: torch.Tensor) -> torch.Tensor:
+        residual = adapter(price_obs)
+        if self.adapter_mode == "zero_anchored_v2":
+            # Subtracting f(0) makes zero price an architectural identity, not
+            # merely an initialization property. It also removes learned biases
+            # that would otherwise perturb the frozen local policy.
+            residual = residual - adapter(torch.zeros_like(price_obs))
+        return residual
+
     def forward(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None):
         base_obs, price_obs = self.split_observation(obs)
         features = self.base_policy.extractor(base_obs)
         if self.price_context_dim > 0:
-            features = features + self.adapter_scale * self.price_adapter(price_obs)
+            features = features + self.adapter_scale * self._price_residual(self.price_adapter, price_obs)
         logits = self.base_policy.logits_head(self.base_policy.actor(features)).reshape(-1, self.act_dim, self.num_bins)
         if self.price_context_dim > 0:
-            logit_bias = self.price_logit_adapter(price_obs).reshape(-1, self.act_dim, self.num_bins)
+            logit_bias = self._price_residual(self.price_logit_adapter, price_obs).reshape(
+                -1,
+                self.act_dim,
+                self.num_bins,
+            )
             logits = logits + self.adapter_scale * logit_bias
         value = self.base_policy.critic(features).squeeze(-1)
         return self._apply_action_mask(logits, action_mask), value

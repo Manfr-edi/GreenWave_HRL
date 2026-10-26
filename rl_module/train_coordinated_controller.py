@@ -1,8 +1,7 @@
-from __future__ import annotations
-
 """Train the full local-controller plus global-coordinator architecture."""
 
-import csv
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -30,7 +29,6 @@ from rl_module.checkpoints import (
     write_history_header,
 )
 from rl_module.coordination import (
-    COORDINATION_PRICE_BINS,
     DEFAULT_OBSERVATION_CONFIG,
     DEFAULT_REWARD_CONFIG,
     augment_local_observation_with_prices,
@@ -66,7 +64,9 @@ CHECKPOINT_MIN_PROMOTION_EPISODES = 5
 def _global_context_tensor(episode, reference_penalty: float | None, device: torch.device) -> torch.Tensor:
     """Compact episode context consumed by the coordinator."""
 
-    reference_value = 0.0 if reference_penalty is None else float(np.clip(float(reference_penalty), -5.0, 5.0))
+    reference_value = 0.0
+    if COORDINATOR.include_reference_penalty_context and reference_penalty is not None:
+        reference_value = float(np.clip(float(reference_penalty), -5.0, 5.0))
     return torch.tensor(
         [
             float(episode.hour) / 23.0,
@@ -218,6 +218,11 @@ def _coordinator_ppo_update(policy, optimizer, rollout: dict, episode_idx: int, 
         value_coef=COORDINATOR.value_coef,
         target_kl=COORDINATOR.target_kl,
         max_grad_norm=LOCAL_CONTROLLER.max_grad_norm,
+        joint_action_dim=(
+            int(rollout["act_dim"])
+            if COORDINATOR.normalize_entropy_and_kl_by_taz
+            else 1
+        ),
     )
 
 
@@ -301,6 +306,7 @@ def main():
         action_bins=LOCAL_CONTROLLER.action_bins,
         adapter_hidden_dim=COORDINATOR.price_adapter_hidden_dim,
         adapter_scale=COORDINATOR.price_adapter_scale,
+        adapter_mode=COORDINATOR.price_adapter_mode,
     ).to(device)
     local_reference_controller = MultiDiscreteActorCritic(base_obs_dim, local_act_dim, LOCAL_CONTROLLER.action_bins).to(device)
     train_local_base_policy = bool(LOCAL_CONTROLLER.train_local_policy)
@@ -369,9 +375,17 @@ def main():
             min_lr=LOCAL_CONTROLLER.min_learning_rate,
         )
     coordinator_optimizer = torch.optim.Adam(coordinator.parameters(), lr=COORDINATOR.learning_rate)
-    coordinator_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        coordinator_optimizer, mode="max", factor=0.7, patience=15, threshold=0.005, threshold_mode="rel", min_lr=1e-5
-    )
+    coordinator_scheduler = None
+    if COORDINATOR.use_lr_scheduler:
+        coordinator_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            coordinator_optimizer,
+            mode="max",
+            factor=0.7,
+            patience=15,
+            threshold=0.005,
+            threshold_mode="rel",
+            min_lr=1e-5,
+        )
     start_episode, resumed_best = resume_coordinated_checkpoint(
         checkpoint_path=COORDINATED_CHECKPOINT_PATH,
         enabled=LOAD_COORDINATED_CHECKPOINT,
@@ -398,7 +412,8 @@ def main():
         "delta_penalty_vs_local_reference", "coordination_reference_mode", "coordination_reference_label",
         "coordination_reference_penalty",
         "checkpoint_score", "checkpoint_score_metric", "checkpoint_selection_score", "checkpoint_selection_metric",
-        "checkpoint_selection_window", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
+        "checkpoint_stability_score", "checkpoint_stability_metric", "checkpoint_selection_window",
+        "checkpoint_promotion_qualified", "terminal_parse_ok", "base_local_reward_mean", "shaped_local_reward_mean",
         "coordination_adjustment_mean", "coordinator_reward_mean", "coordinator_price_mean",
         "coordinator_price_std", "mean_emission_penalty", "max_emission_penalty",
         "mean_emission_delta", "total_emission_delta", "worst_taz_worsening",
@@ -418,6 +433,7 @@ def main():
     best_delta_penalty_vs_baseline = None
     best_delta_penalty_vs_local_reference = None
     best_episode = -1
+    best_checkpoint_qualified = False
     if resumed_best:
         if resumed_best["best_checkpoint_score"] is not None:
             best_checkpoint_score = float(resumed_best["best_checkpoint_score"])
@@ -429,6 +445,7 @@ def main():
         best_delta_penalty_vs_baseline = resumed_best["best_delta_penalty_vs_baseline"]
         best_delta_penalty_vs_local_reference = resumed_best["best_delta_penalty_vs_local_reference"]
         best_episode = int(resumed_best["best_episode"])
+        best_checkpoint_qualified = bool(resumed_best["best_checkpoint_qualified"])
     last_completed_episode = start_episode - 1
     interrupted = False
 
@@ -495,7 +512,20 @@ def main():
             print(f"[WARN] SUMO local-reference output cleanup errors: {local_reference_cleanup['errors'][:3]}")
 
         coordination_reference_mode = str(COORDINATOR.coordination_reference_mode)
-        use_local_reference = coordination_reference_mode == "local_only" and local_reference_penalty is not None
+        if (
+            coordination_reference_mode in ("local_only", "local_reference")
+            and local_reference_penalty is None
+        ):
+            print(
+                "[WARN] Skipping episode because local-reference mode requires a "
+                "valid paired local penalty; falling back to the no-agent baseline "
+                "would mix checkpoint objectives."
+            )
+            continue
+        use_local_reference = (
+            coordination_reference_mode in ("local_only", "local_reference")
+            and local_reference_penalty is not None
+        )
         coordination_reference_penalty = local_reference_penalty if use_local_reference else baseline_penalty
         coordination_reference_components = local_reference_components if use_local_reference else baseline_components
         coordination_reference_label = "local_reference" if use_local_reference else "baseline"
@@ -656,7 +686,8 @@ def main():
         coordinator_stats = _coordinator_ppo_update(coordinator, coordinator_optimizer, coordinator_rollout, episode_idx, total_episodes)
         coordinator_lr = float(coordinator_optimizer.param_groups[0]["lr"])
         coordinator_rewards_t = torch.stack(coordinator_rollout["rewards"]).reshape(-1, 1)
-        coordinator_scheduler.step(float(coordinator_rewards_t.mean().item()))
+        if coordinator_scheduler is not None:
+            coordinator_scheduler.step(float(coordinator_rewards_t.mean().item()))
 
         terminal_components = dict((env.last_reward_components or {}).get("terminal_reward", {}) or {})
         terminal_parse_ok = bool(terminal_components.get("parse_ok", False))
@@ -685,13 +716,6 @@ def main():
             coordination_reference_penalty,
             metric_name=checkpoint_metric_name,
         )
-        if checkpoint_score is not None:
-            checkpoint_score = float(
-                checkpoint_score
-                + 0.50 * emission_imbalance_score
-                + 0.50 * worst_taz_worsening_score
-            )
-            checkpoint_metric = f"{checkpoint_metric}+emission_imbalance+worse_taz"
         base_local_reward = torch.stack(local_rollout["base_rewards"]).sum(dim=0)
         shaped_local_reward = torch.stack(local_rollout["rewards"]).sum(dim=0)
         coordinator_prices = torch.cat([coordinator.action_values(actions).reshape(-1).detach().cpu() for actions in coordinator_rollout["actions"]])
@@ -747,14 +771,48 @@ def main():
             "route_sampler_seed": int(episode.route_sampler_seed),
             "route_folder_path": route_folder_path,
         }
-        checkpoint_selection_score, checkpoint_selection_metric, checkpoint_selection_window = rolling_checkpoint_score(
+        checkpoint_stability_score, checkpoint_stability_metric, checkpoint_selection_window = rolling_checkpoint_score(
             [*history, row],
+            score_key="checkpoint_score",
             window_size=CHECKPOINT_SCORE_WINDOW,
             min_count=CHECKPOINT_MIN_PROMOTION_EPISODES,
+            aggregation="median",
+        )
+        checkpoint_is_eligible = bool(
+            checkpoint_score is not None
+            and checkpoint_score <= 0.0
+            and checkpoint_stability_score is not None
+            and checkpoint_stability_score <= 0.0
+        )
+        checkpoint_can_seed_best = bool(checkpoint_score is not None and best_episode < 0)
+        # The candidate must improve on its own rollout. Rank it by the worse of
+        # that current delta and the robust recent trend so one lucky route
+        # cannot dominate checkpoint selection. The first valid rollout is kept
+        # only as an explicitly provisional fallback for a fresh run.
+        checkpoint_selection_score = (
+            float(max(checkpoint_score, checkpoint_stability_score))
+            if checkpoint_is_eligible
+            else float(checkpoint_score)
+            if checkpoint_can_seed_best
+            else None
+        )
+        checkpoint_selection_metric = (
+            f"max({checkpoint_metric}_current,{checkpoint_stability_metric})"
+            if checkpoint_is_eligible
+            else f"{checkpoint_metric}_current_provisional"
+            if checkpoint_can_seed_best
+            else None
         )
         row["checkpoint_selection_score"] = checkpoint_selection_score if checkpoint_selection_score is not None else ""
         row["checkpoint_selection_metric"] = checkpoint_selection_metric or ""
+        row["checkpoint_stability_score"] = (
+            checkpoint_stability_score
+            if checkpoint_stability_score is not None
+            else ""
+        )
+        row["checkpoint_stability_metric"] = checkpoint_stability_metric or ""
         row["checkpoint_selection_window"] = int(checkpoint_selection_window)
+        row["checkpoint_promotion_qualified"] = bool(checkpoint_is_eligible)
         append_history(row, EXPERIMENT.history_csv_path, EXPERIMENT.history_json_path, csv_cols, history)
 
         detail_payload = {
@@ -784,7 +842,11 @@ def main():
             "local_optimizer_state_dict": local_optimizer.state_dict() if local_optimizer is not None else None,
             "coordinator_optimizer_state_dict": coordinator_optimizer.state_dict(),
             "local_scheduler_state_dict": local_scheduler.state_dict() if local_scheduler is not None else None,
-            "coordinator_scheduler_state_dict": coordinator_scheduler.state_dict(),
+            "coordinator_scheduler_state_dict": (
+                coordinator_scheduler.state_dict()
+                if coordinator_scheduler is not None
+                else None
+            ),
             **_settings_payload(),
             "taz_ids": taz_ids,
             "tls_ids": env.get_tls_ids(),
@@ -798,6 +860,7 @@ def main():
             "best_episode": int(best_episode),
             "best_checkpoint_metric": best_checkpoint_metric,
             "best_checkpoint_score": best_checkpoint_score if math.isfinite(best_checkpoint_score) else None,
+            "best_checkpoint_qualified": bool(best_checkpoint_qualified),
             "best_terminal_penalty": best_terminal_penalty if math.isfinite(best_terminal_penalty) else None,
             "best_baseline_penalty": best_baseline_penalty,
             "best_local_reference_penalty": best_local_reference_penalty,
@@ -807,7 +870,10 @@ def main():
             "checkpoint_score": checkpoint_score,
             "checkpoint_selection_metric": checkpoint_selection_metric,
             "checkpoint_selection_score": checkpoint_selection_score,
+            "checkpoint_stability_metric": checkpoint_stability_metric,
+            "checkpoint_stability_score": checkpoint_stability_score,
             "checkpoint_selection_window": int(checkpoint_selection_window),
+            "checkpoint_promotion_qualified": bool(checkpoint_is_eligible),
             "baseline_penalty": baseline_penalty,
             "delta_penalty_vs_baseline": delta_penalty_vs_baseline,
             "local_reference_penalty": local_reference_penalty,
@@ -815,9 +881,21 @@ def main():
             "coordination_reference_penalty": coordination_reference_penalty,
         }
         _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, f"coordinated_controller_episode{episode_idx}.pt"), checkpoint_payload)
-        if checkpoint_selection_score is not None and checkpoint_selection_score < best_checkpoint_score:
+        should_promote = bool(
+            checkpoint_selection_score is not None
+            and (
+                best_episode < 0
+                or (checkpoint_is_eligible and not best_checkpoint_qualified)
+                or (
+                    checkpoint_is_eligible == best_checkpoint_qualified
+                    and checkpoint_selection_score < best_checkpoint_score
+                )
+            )
+        )
+        if should_promote:
             best_checkpoint_score = float(checkpoint_selection_score)
             best_checkpoint_metric = checkpoint_selection_metric
+            best_checkpoint_qualified = bool(checkpoint_is_eligible)
             best_terminal_penalty = float(terminal_penalty) if terminal_penalty is not None else float("inf")
             best_baseline_penalty = baseline_penalty if baseline_penalty is not None else None
             best_local_reference_penalty = local_reference_penalty if local_reference_penalty is not None else None
@@ -843,7 +921,10 @@ def main():
             best_payload["best_delta_penalty_vs_local_reference"] = best_delta_penalty_vs_local_reference
             best_payload["checkpoint_selection_metric"] = checkpoint_selection_metric
             best_payload["checkpoint_selection_score"] = checkpoint_selection_score
+            best_payload["checkpoint_stability_metric"] = checkpoint_stability_metric
+            best_payload["checkpoint_stability_score"] = checkpoint_stability_score
             best_payload["checkpoint_selection_window"] = int(checkpoint_selection_window)
+            best_payload["best_checkpoint_qualified"] = bool(best_checkpoint_qualified)
             best_payload["policy_stage"] = "pre_update_rollout_policy"
             _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_best.pt"), best_payload)
         output_cleanup = cleanup_sumo_output_files(route_folder_path)
@@ -877,7 +958,11 @@ def main():
         "local_optimizer_state_dict": local_optimizer.state_dict() if local_optimizer is not None else None,
         "coordinator_optimizer_state_dict": coordinator_optimizer.state_dict(),
         "local_scheduler_state_dict": local_scheduler.state_dict() if local_scheduler is not None else None,
-        "coordinator_scheduler_state_dict": coordinator_scheduler.state_dict(),
+        "coordinator_scheduler_state_dict": (
+            coordinator_scheduler.state_dict()
+            if coordinator_scheduler is not None
+            else None
+        ),
         **_settings_payload(),
         "taz_ids": taz_ids,
         "tls_ids": env.get_tls_ids(),
@@ -896,6 +981,7 @@ def main():
         "best_local_reference_penalty": best_local_reference_penalty,
         "best_delta_penalty_vs_baseline": best_delta_penalty_vs_baseline,
         "best_delta_penalty_vs_local_reference": best_delta_penalty_vs_local_reference,
+        "best_checkpoint_qualified": bool(best_checkpoint_qualified),
         "interrupted": bool(interrupted),
     }
     _save_checkpoint(os.path.join(EXPERIMENT.checkpoint_dir, "coordinated_controller_final.pt"), final_payload)

@@ -1,11 +1,12 @@
-from __future__ import annotations
-
 """Checkpoint and history helpers for RL training scripts."""
+
+from __future__ import annotations
 
 import csv
 import json
 import math
 import os
+import statistics
 
 import torch
 
@@ -98,6 +99,12 @@ def checkpoint_best_metadata(checkpoint: dict) -> dict:
             "best_delta_penalty_vs_local_reference",
             "delta_penalty_vs_local_reference",
         ),
+        "best_checkpoint_qualified": bool(
+            checkpoint.get(
+                "best_checkpoint_qualified",
+                checkpoint.get("checkpoint_promotion_qualified", False),
+            )
+        ),
     }
 
 
@@ -107,11 +114,12 @@ def rolling_checkpoint_score(
     score_key: str = "checkpoint_score",
     window_size: int = 10,
     min_count: int = 5,
+    aggregation: str = "mean",
 ) -> tuple[float | None, str | None, int]:
-    """Return a rolling mean score for checkpoint promotion.
+    """Return a rolling score for checkpoint-promotion stability checks.
 
-    Lower scores are better. Using a short rolling window keeps best selection
-    from being dominated by one unusually favorable or unfavorable route.
+    Lower scores are better. Median aggregation is useful for route-varying
+    coordinated rollouts because it cannot be dominated by a single outlier.
     """
 
     scores = []
@@ -124,7 +132,13 @@ def rolling_checkpoint_score(
     recent = scores[-max(int(window_size), 1):]
     if len(recent) < max(int(min_count), 1):
         return None, None, len(recent)
-    return float(sum(recent) / len(recent)), f"{score_key}_rolling_mean_{len(recent)}", len(recent)
+    if aggregation == "mean":
+        value = float(sum(recent) / len(recent))
+    elif aggregation == "median":
+        value = float(statistics.median(recent))
+    else:
+        raise ValueError(f"Unsupported rolling checkpoint aggregation: {aggregation!r}")
+    return value, f"{score_key}_rolling_{aggregation}_{len(recent)}", len(recent)
 
 
 def load_checkpoint(path: str) -> dict:
@@ -206,6 +220,19 @@ def resume_coordinated_checkpoint(
     if not enabled:
         return int(start_episode_override or 0), {}
     checkpoint = load_checkpoint(checkpoint_path)
+    expected_adapter_mode = getattr(local_policy, "adapter_mode", None)
+    if expected_adapter_mode is not None:
+        coordinator_settings = dict(checkpoint.get("coordinator_settings", {}) or {})
+        checkpoint_adapter_mode = str(
+            coordinator_settings.get("price_adapter_mode", "legacy")
+        )
+        if checkpoint_adapter_mode != str(expected_adapter_mode):
+            raise ValueError(
+                "Cannot resume a coordinated checkpoint with a different price-adapter "
+                f"architecture: checkpoint={checkpoint_adapter_mode!r}, "
+                f"current={expected_adapter_mode!r}. Start a fresh coordinated run "
+                "from the pretrained local checkpoint instead."
+            )
     if checkpoint.get("local_controller_state_dict") is not None:
         local_policy.load_state_dict(checkpoint["local_controller_state_dict"])
     if checkpoint.get("coordinator_state_dict") is not None:

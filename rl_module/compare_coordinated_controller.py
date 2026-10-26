@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Evaluate RL controllers against a no-agent baseline.
 
 The report can include the local-only controller, the coordinated controller, or
@@ -7,9 +5,12 @@ both. This lets the same route scenario answer two separate questions: whether
 local control alone helps, and whether the global coordinator adds value.
 """
 
+from __future__ import annotations
+
 import argparse
 import calendar
 import csv
+import hashlib
 import json
 import os
 import random
@@ -158,7 +159,7 @@ SUPPORT_COLORS = {
     "local_greedy": "#2a9d8f",
     "coordinated_greedy": "#e76f51",
 }
-EVALUATION_METRIC_SCHEMA_VERSION = 2
+EVALUATION_METRIC_SCHEMA_VERSION = 4
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -183,8 +184,34 @@ def _parse_timeslot(timeslot: str) -> tuple[int, str]:
 
 def _load_dataclass_config(raw: dict | None, config_cls):
     raw = dict(raw or {})
+    if config_cls is CoordinationRewardConfig and "reward_semantics_version" not in raw:
+        # Saved v1 checkpoints used price-weighted externalities. Preserve
+        # their rollout diagnostics while new training records version 2.
+        raw["reward_semantics_version"] = 1
     valid_keys = {field.name for field in fields(config_cls)}
     return config_cls(**{key: raw[key] for key in raw if key in valid_keys})
+
+
+def _coordination_reference_mode(checkpoint: dict) -> str:
+    """Read reference mode consistently across current and legacy checkpoints."""
+
+    coordinator_settings = dict(checkpoint.get("coordinator_settings", {}) or {})
+    return str(
+        checkpoint.get(
+            "coordination_reference_mode",
+            coordinator_settings.get("coordination_reference_mode", "no_agent_baseline"),
+        )
+    )
+
+
+def _checkpoint_requires_local_reference(checkpoint: dict) -> bool:
+    """Whether actions depend on a precomputed local-reference penalty."""
+
+    if _coordination_reference_mode(checkpoint) not in ("local_only", "local_reference"):
+        return False
+    coordinator_settings = dict(checkpoint.get("coordinator_settings", {}) or {})
+    # Legacy coordinators consumed this future outcome in their observation.
+    return bool(coordinator_settings.get("include_reference_penalty_context", True))
 
 
 def _parse_tripinfo_emission_totals(tripinfo_path: str) -> dict:
@@ -429,11 +456,36 @@ def _co2_taz_aliases(emission_taz_summary: dict) -> dict:
     }
 
 
+def _generated_route_vehicle_count(route_folder_path: str) -> int | None:
+    """Count the actual demand encoded in generatedRoutes.rou.xml."""
+
+    route_path = os.path.join(route_folder_path, "generatedRoutes.rou.xml")
+    total = 0
+    try:
+        for _, element in ET.iterparse(route_path, events=("end",)):
+            tag = str(element.tag).rsplit("}", maxsplit=1)[-1]
+            if tag in ("vehicle", "trip"):
+                total += 1
+            elif tag == "flow":
+                number = element.get("number")
+                if number is None:
+                    # Probability/rate flows do not encode an exact expected
+                    # count, so using a partial total would be misleading.
+                    return None
+                total += int(round(float(number)))
+            element.clear()
+    except (OSError, ET.ParseError, TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
 def _collect_run_metrics(
     run_root: str,
     waiting_components: dict | None = None,
     taz_ids: list[str] | None = None,
     taz_polygons: dict[str, list[tuple[float, float]]] | None = None,
+    expected_trip_count: int | None = None,
+    expected_trip_count_source: str | None = None,
 ) -> dict:
     output_dir = os.path.join(run_root, "output")
     waiting = dict(waiting_components or {})
@@ -442,13 +494,28 @@ def _collect_run_metrics(
     completed_trip_emissions = _parse_tripinfo_emission_totals(tripinfo_path)
     emissions_by_taz_payload = _parse_emission_output_by_taz(emission_output_path, taz_ids, taz_polygons)
     emission_taz_summary = _summarize_emissions_by_taz(emissions_by_taz_payload["emissions_by_taz"], taz_ids)
-    trip_count = int(waiting.get("trip_count", 0))
+    tracked_vehicle_count = int(waiting.get("trip_count", 0))
+    has_explicit_expected_count = expected_trip_count is not None
+    expected_count = int(expected_trip_count) if has_explicit_expected_count else tracked_vehicle_count
     completed_trip_count = int(completed_trip_emissions["tripinfo_count"])
     return {
-        "trip_count": trip_count,
+        # ``trip_count`` is retained for report compatibility, but it counts
+        # vehicles observed inside the configured TAZs rather than all routes.
+        "trip_count": tracked_vehicle_count,
+        "tracked_vehicle_count": tracked_vehicle_count,
+        "expected_trip_count": expected_count if expected_count > 0 else None,
         "tripinfo_count": completed_trip_count,
         "completed_trip_count": completed_trip_count,
-        "completed_trip_rate": float(completed_trip_count / trip_count) if trip_count > 0 else None,
+        "completed_trip_rate": (
+            float(completed_trip_count / expected_count)
+            if expected_count > 0
+            else None
+        ),
+        "completed_trip_rate_denominator": (
+            str(expected_trip_count_source or "provided_expected_trip_count")
+            if has_explicit_expected_count and expected_count > 0
+            else "tracked_vehicle_count_legacy" if expected_count > 0 else None
+        ),
         "emission_trip_count": int(completed_trip_emissions["emission_trip_count"]),
         "avg_waiting_time": float(waiting.get("avg_waiting_time", 0.0)),
         "total_waiting_time": float(waiting.get("total_waiting_time", 0.0)),
@@ -529,8 +596,15 @@ def _evaluation_episode(simulation_date: str, hour: int, episode_index: int, dem
     )
 
 
-def _global_context_tensor(episode: EpisodeDemand, reference_penalty: float | None, device: torch.device) -> torch.Tensor:
-    reference_value = 0.0 if reference_penalty is None else float(np.clip(float(reference_penalty), -5.0, 5.0))
+def _global_context_tensor(
+    episode: EpisodeDemand,
+    reference_penalty: float | None,
+    device: torch.device,
+    include_reference_penalty: bool,
+) -> torch.Tensor:
+    reference_value = 0.0
+    if include_reference_penalty and reference_penalty is not None:
+        reference_value = float(np.clip(float(reference_penalty), -5.0, 5.0))
     return torch.tensor(
         [
             float(episode.hour) / 23.0,
@@ -580,6 +654,7 @@ def _build_policy_bundle(checkpoint: dict, env: CoordinatedTazTrafficEnv, adjace
             action_bins=local_action_bins,
             adapter_hidden_dim=int(coordinator_settings.get("price_adapter_hidden_dim", COORDINATOR.price_adapter_hidden_dim)),
             adapter_scale=float(coordinator_settings.get("price_adapter_scale", COORDINATOR.price_adapter_scale)),
+            adapter_mode=str(coordinator_settings.get("price_adapter_mode", "legacy")),
         ).to(device)
     else:
         local_policy = MultiDiscreteActorCritic(local_obs_dim, env.max_control_groups_per_taz, local_action_bins).to(device)
@@ -600,7 +675,11 @@ def _build_policy_bundle(checkpoint: dict, env: CoordinatedTazTrafficEnv, adjace
         "price_bins": price_bins,
         "local_action_bins": local_action_bins,
         "local_policy_class": local_policy_class,
-        "coordination_reference_mode": str(checkpoint.get("coordination_reference_mode", "no_agent_baseline")),
+        "coordination_reference_mode": _coordination_reference_mode(checkpoint),
+        "include_reference_penalty_context": bool(
+            coordinator_settings.get("include_reference_penalty_context", True)
+        ),
+        "price_adapter_mode": str(coordinator_settings.get("price_adapter_mode", "legacy")),
         "coordinator_obs_dim": int(coordinator_obs_dim),
         "local_obs_dim": int(local_obs_dim),
     }
@@ -842,7 +921,14 @@ def _run_rl_episode(
                 previous_prices=previous_prices,
                 previous_action_summary=previous_action_summary,
                 taz_ids=taz_ids,
-                extra_context=_global_context_tensor(episode, reference_penalty, device),
+                extra_context=_global_context_tensor(
+                    episode,
+                    reference_penalty,
+                    device,
+                    include_reference_penalty=bool(
+                        bundle.get("include_reference_penalty_context", True)
+                    ),
+                ),
                 config=bundle["observation_config"],
                 price_max=max(tuple(bundle.get("price_bins", COORDINATION_PRICE_BINS))),
             )
@@ -984,7 +1070,10 @@ def _build_comparison(baseline_metrics: dict, rl_metrics: dict, reference_name: 
     }
 
 
-def _aggregate_metrics(metrics_list: list[dict]) -> dict:
+def _aggregate_metrics(metrics_list: list[dict]) -> dict | None:
+    if not metrics_list:
+        return None
+
     taz_ids = sorted({
         str(taz_id)
         for metrics in metrics_list
@@ -993,6 +1082,14 @@ def _aggregate_metrics(metrics_list: list[dict]) -> dict:
 
     def _mean(key: str) -> float:
         return float(np.mean([_safe_float(metrics.get(key), 0.0) for metrics in metrics_list]))
+
+    def _mean_with_fallback(key: str, fallback_key: str) -> float:
+        return float(
+            np.mean([
+                _safe_float(metrics.get(key, metrics.get(fallback_key)), 0.0)
+                for metrics in metrics_list
+            ])
+        )
 
     def _mean_optional(key: str):
         values = [float(metrics.get(key)) for metrics in metrics_list if _is_number(metrics.get(key))]
@@ -1006,12 +1103,26 @@ def _aggregate_metrics(metrics_list: list[dict]) -> dict:
         emissions_by_taz[taz_id]["sample_count"] = float(np.mean([_safe_float(bucket.get("sample_count"), 0.0) for bucket in buckets]))
 
     emission_taz_summary = _summarize_emissions_by_taz(emissions_by_taz, taz_ids)
+    denominator_sources = {
+        str(metrics.get("completed_trip_rate_denominator"))
+        for metrics in metrics_list
+        if metrics.get("completed_trip_rate_denominator")
+    }
+    if len(denominator_sources) == 1:
+        denominator_source = next(iter(denominator_sources))
+    elif denominator_sources:
+        denominator_source = "mixed"
+    else:
+        denominator_source = None
     return {
         "run_count": int(len(metrics_list)),
         "trip_count": _mean("trip_count"),
+        "tracked_vehicle_count": _mean_with_fallback("tracked_vehicle_count", "trip_count"),
+        "expected_trip_count": _mean_optional("expected_trip_count"),
         "tripinfo_count": _mean("tripinfo_count"),
         "completed_trip_count": _mean("completed_trip_count"),
         "completed_trip_rate": _mean_optional("completed_trip_rate"),
+        "completed_trip_rate_denominator": denominator_source,
         "emission_trip_count": _mean("emission_trip_count"),
         "avg_waiting_time": _mean("avg_waiting_time"),
         "total_waiting_time": _mean("total_waiting_time"),
@@ -1665,17 +1776,31 @@ def _validate_checkpoint_paths(paths_by_day_type: dict[str, str], label: str, st
     return False
 
 
+def _checkpoint_sha256(path: str) -> str:
+    """Fingerprint checkpoint contents so resume never trusts a reused filename."""
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_checkpoint_entries(paths_by_day_type: dict[str, str]) -> dict[str, dict]:
     cache = {}
     entries = {}
     for day_type, path in paths_by_day_type.items():
         abs_path = os.path.abspath(path)
         if abs_path not in cache:
-            cache[abs_path] = torch.load(abs_path, map_location="cpu", weights_only=True)
+            cache[abs_path] = {
+                "checkpoint": torch.load(abs_path, map_location="cpu", weights_only=True),
+                "sha256": _checkpoint_sha256(abs_path),
+            }
         entries[day_type] = {
             "day_type": day_type,
             "path": abs_path,
-            "checkpoint": cache[abs_path],
+            "checkpoint": cache[abs_path]["checkpoint"],
+            "sha256": cache[abs_path]["sha256"],
         }
     return entries
 
@@ -1691,12 +1816,37 @@ def _checkpoint_taz_ids(entries: dict[str, dict]) -> list[str]:
 
 
 def _selected_taz_ids_from_entries(*entry_maps: dict[str, dict]) -> list[str] | None:
-    all_ids = []
+    checkpoint_orders = []
     for entries in entry_maps:
-        for taz_id in _checkpoint_taz_ids(entries or {}):
-            if taz_id not in all_ids:
-                all_ids.append(taz_id)
-    return all_ids if len(all_ids) == 1 else None
+        for entry in (entries or {}).values():
+            taz_ids = tuple(str(taz_id) for taz_id in entry.get("checkpoint", {}).get("taz_ids", []) or [])
+            if taz_ids:
+                checkpoint_orders.append(taz_ids)
+    if not checkpoint_orders:
+        return None
+    expected = checkpoint_orders[0]
+    incompatible = [order for order in checkpoint_orders[1:] if order != expected]
+    if incompatible:
+        raise ValueError(
+            "Checkpoint TAZ IDs/order differ across selected policies. "
+            "Using the runtime map would permute coordinator action heads."
+        )
+    return list(expected)
+
+
+def _checkpoint_metadata_consensus(key: str, *entry_maps: dict[str, dict]):
+    values = [
+        entry.get("checkpoint", {}).get(key)
+        for entries in entry_maps
+        for entry in (entries or {}).values()
+        if entry.get("checkpoint", {}).get(key) is not None
+    ]
+    if not values:
+        return None
+    expected = values[0]
+    if any(value != expected for value in values[1:]):
+        raise ValueError(f"Checkpoint {key} metadata differ across selected policies.")
+    return expected
 
 
 def _checkpoint_local_state_dict(checkpoint: dict) -> dict:
@@ -1715,18 +1865,38 @@ def _audit_local_checkpoint_compatibility(local_checkpoint: dict, coordinated_ch
     prefix = "base_policy." if coordinated_policy_class == "PriceAdapterActorCritic" else ""
     compared_tensor_count = 0
     missing_tensor_keys = []
+    unexpected_tensor_keys = []
+    different_tensor_keys = []
     max_abs_difference = 0.0
     for key, local_tensor in local_state.items():
         coordinated_key = f"{prefix}{key}"
         coordinated_tensor = coordinated_state.get(coordinated_key)
-        if coordinated_tensor is None or tuple(local_tensor.shape) != tuple(coordinated_tensor.shape):
+        if (
+            coordinated_tensor is None
+            or not isinstance(local_tensor, torch.Tensor)
+            or not isinstance(coordinated_tensor, torch.Tensor)
+            or tuple(local_tensor.shape) != tuple(coordinated_tensor.shape)
+        ):
             missing_tensor_keys.append(coordinated_key)
             continue
         compared_tensor_count += 1
-        max_abs_difference = max(
-            max_abs_difference,
-            float((local_tensor.detach().cpu() - coordinated_tensor.detach().cpu()).abs().max().item()),
-        )
+        local_cpu = local_tensor.detach().cpu()
+        coordinated_cpu = coordinated_tensor.detach().cpu()
+        if not torch.equal(local_cpu, coordinated_cpu):
+            different_tensor_keys.append(coordinated_key)
+            if local_cpu.numel() > 0:
+                max_abs_difference = max(
+                    max_abs_difference,
+                    float((local_cpu - coordinated_cpu).abs().max().item()),
+                )
+
+    expected_base_keys = {f"{prefix}{key}" for key in local_state}
+    actual_base_keys = (
+        {str(key) for key in coordinated_state if str(key).startswith(prefix)}
+        if prefix
+        else {str(key) for key in coordinated_state}
+    )
+    unexpected_tensor_keys = sorted(actual_base_keys - expected_base_keys)
 
     local_experiment = dict(local_checkpoint.get("experiment_settings", {}) or {})
     coordinated_experiment = dict(coordinated_checkpoint.get("experiment_settings", {}) or {})
@@ -1744,7 +1914,13 @@ def _audit_local_checkpoint_compatibility(local_checkpoint: dict, coordinated_ch
         for key in environment_keys
         if local_environment.get(key) != coordinated_environment.get(key)
     }
-    same_base_weights = bool(compared_tensor_count > 0 and not missing_tensor_keys and max_abs_difference <= 1e-8)
+    same_base_weights = bool(
+        compared_tensor_count == len(local_state)
+        and compared_tensor_count > 0
+        and not missing_tensor_keys
+        and not unexpected_tensor_keys
+        and not different_tensor_keys
+    )
     metadata_compatible = bool(not experiment_mismatches and not environment_mismatches)
     return {
         "incremental_comparison_valid": bool(same_base_weights and metadata_compatible),
@@ -1752,6 +1928,8 @@ def _audit_local_checkpoint_compatibility(local_checkpoint: dict, coordinated_ch
         "max_abs_local_base_weight_difference": float(max_abs_difference),
         "compared_tensor_count": int(compared_tensor_count),
         "missing_tensor_keys": missing_tensor_keys,
+        "unexpected_tensor_keys": unexpected_tensor_keys,
+        "different_tensor_keys": different_tensor_keys,
         "metadata_compatible": metadata_compatible,
         "experiment_mismatches": experiment_mismatches,
         "environment_mismatches": environment_mismatches,
@@ -1806,6 +1984,8 @@ def _load_resumable_report(
     episode: EpisodeDemand,
     local_checkpoint_path: str | None,
     coordinated_checkpoint_path: str | None,
+    local_checkpoint_sha256: str | None,
+    coordinated_checkpoint_sha256: str | None,
 ) -> dict | None:
     report_path = _episode_report_path(args.report_root, episode)
     if not os.path.exists(report_path):
@@ -1820,13 +2000,21 @@ def _load_resumable_report(
         "local_checkpoint_path": os.path.abspath(local_checkpoint_path) if local_checkpoint_path else None,
         "coordinated_checkpoint_path": os.path.abspath(coordinated_checkpoint_path) if coordinated_checkpoint_path else None,
     }
+    expected_fingerprints = {
+        "local_checkpoint_sha256": local_checkpoint_sha256 if local_checkpoint_path else None,
+        "coordinated_checkpoint_sha256": coordinated_checkpoint_sha256 if coordinated_checkpoint_path else None,
+    }
     matches_identity = (
         int(report.get("evaluation_metric_schema_version", 0)) == EVALUATION_METRIC_SCHEMA_VERSION
         and report.get("date") == episode.simulation_date
         and report.get("timeslot") == episode.timeslot
         and int(report.get("episode_index", -1)) == int(episode.episode_idx)
+        and report.get("episode_demand") == episode.__dict__
         and report.get("local_checkpoint_path") == expected_paths["local_checkpoint_path"]
         and report.get("coordinated_checkpoint_path") == expected_paths["coordinated_checkpoint_path"]
+        and report.get("local_checkpoint_sha256") == expected_fingerprints["local_checkpoint_sha256"]
+        and report.get("coordinated_checkpoint_sha256")
+        == expected_fingerprints["coordinated_checkpoint_sha256"]
     )
     if not matches_identity:
         return None
@@ -1858,6 +2046,8 @@ def _run_single_evaluation(
     checkpoint: dict | None,
     local_checkpoint_path: str | None,
     coordinated_checkpoint_path: str | None,
+    local_checkpoint_sha256: str | None,
+    coordinated_checkpoint_sha256: str | None,
     sumo,
     planner,
     env: CoordinatedTazTrafficEnv,
@@ -1890,6 +2080,22 @@ def _run_single_evaluation(
 
     route_folder_path, generated = ensure_routes(episode, planner, DEMAND)
     print(f"[ROUTES] {'generated' if generated else 'cached'} | {route_folder_path}")
+    route_vehicle_count = _generated_route_vehicle_count(route_folder_path)
+    if route_vehicle_count is None:
+        expected_trip_count = int(episode.vehicle_count)
+        expected_trip_count_source = "episode_vehicle_count_fallback"
+        print(
+            "[WARN] Could not count exact generated-route demand; "
+            f"using episode target {expected_trip_count}."
+        )
+    else:
+        expected_trip_count = int(route_vehicle_count)
+        expected_trip_count_source = "generated_route_file"
+        if expected_trip_count != int(episode.vehicle_count):
+            print(
+                "[ROUTES] Generated demand differs from routeSampler target: "
+                f"actual={expected_trip_count} target={episode.vehicle_count}"
+            )
 
     print("[BASELINE] Running no-agent baseline.")
     sumo.changeRouteFilePath(route_folder_path)
@@ -1900,6 +2106,8 @@ def _run_single_evaluation(
         waiting_components=baseline_components,
         taz_ids=taz_ids,
         taz_polygons=taz_polygons,
+        expected_trip_count=expected_trip_count,
+        expected_trip_count_source=expected_trip_count_source,
     )
     baseline_metrics["run_dir"] = baseline_run_dir
     baseline_penalty = float(baseline_components.get("penalty", 0.0)) if baseline_components.get("parse_ok", False) else None
@@ -1920,6 +2128,8 @@ def _run_single_evaluation(
             waiting_components=rollout["terminal_reward"],
             taz_ids=taz_ids,
             taz_polygons=taz_polygons,
+            expected_trip_count=expected_trip_count,
+            expected_trip_count_source=expected_trip_count_source,
         )
         local_greedy_metrics["run_dir"] = local_greedy_run_dir
         local_greedy_metrics["local_rollout"] = rollout["local_rollout"]
@@ -1943,6 +2153,8 @@ def _run_single_evaluation(
                 waiting_components=rollout["terminal_reward"],
                 taz_ids=taz_ids,
                 taz_polygons=taz_polygons,
+                expected_trip_count=expected_trip_count,
+                expected_trip_count_source=expected_trip_count_source,
             )
             metrics["run_dir"] = run_dir
             metrics["run_index"] = int(run_idx + 1)
@@ -1958,8 +2170,18 @@ def _run_single_evaluation(
     coordination_reference_penalty = None
     if run_coordinated:
         coordination_reference_mode = str(coordinated_bundle.get("coordination_reference_mode", "no_agent_baseline"))
-        if coordination_reference_mode in ("local_only", "local_reference") and local_reference_penalty is not None:
-            coordination_reference_penalty = local_reference_penalty
+        if coordination_reference_mode in ("local_only", "local_reference"):
+            if local_reference_penalty is None:
+                if bool(coordinated_bundle.get("include_reference_penalty_context", True)):
+                    raise RuntimeError(
+                        "The coordinated policy requires a valid local-reference penalty, "
+                        "but the local rollout did not produce one."
+                    )
+                # New coordinators do not observe the paired terminal outcome,
+                # so traffic actions remain evaluable without a local rollout.
+                coordination_reference_penalty = None
+            else:
+                coordination_reference_penalty = local_reference_penalty
         else:
             coordination_reference_mode = "no_agent_baseline"
             coordination_reference_penalty = baseline_penalty
@@ -1979,6 +2201,8 @@ def _run_single_evaluation(
             waiting_components=rollout["terminal_reward"],
             taz_ids=taz_ids,
             taz_polygons=taz_polygons,
+            expected_trip_count=expected_trip_count,
+            expected_trip_count_source=expected_trip_count_source,
         )
         coordinated_greedy_metrics["run_dir"] = coordinated_greedy_run_dir
         coordinated_greedy_metrics["coordination_rollout"] = rollout["coordination_rollout"]
@@ -2006,6 +2230,8 @@ def _run_single_evaluation(
                 waiting_components=rollout["terminal_reward"],
                 taz_ids=taz_ids,
                 taz_polygons=taz_polygons,
+                expected_trip_count=expected_trip_count,
+                expected_trip_count_source=expected_trip_count_source,
             )
             metrics["run_dir"] = run_dir
             metrics["run_index"] = int(run_idx + 1)
@@ -2022,18 +2248,27 @@ def _run_single_evaluation(
         "episode_demand": episode.__dict__,
         "checkpoint_mode": _checkpoint_mode(args),
         "local_checkpoint_path": local_checkpoint_path if run_local else None,
+        "local_checkpoint_sha256": local_checkpoint_sha256 if run_local else None,
         "local_checkpoint_episode": int(local_checkpoint.get("episode", -1)) if run_local else None,
         "coordinated_checkpoint_path": coordinated_checkpoint_path if run_coordinated else None,
+        "coordinated_checkpoint_sha256": coordinated_checkpoint_sha256 if run_coordinated else None,
         "coordinated_checkpoint_episode": int(checkpoint.get("episode", -1)) if run_coordinated else None,
         "architecture_name": "baseline_vs_local_vs_coordinated",
         "traffic_flow_file_path": episode.traffic_flow_file_path,
         "route_folder_path": route_folder_path,
         "route_generated": bool(generated),
+        "route_vehicle_count": route_vehicle_count,
         "taz_ids": taz_ids,
         "tls_ids": env.get_tls_ids(),
         "coordination_price_bins": list(coordinated_bundle["price_bins"]) if run_coordinated else None,
         "coordination_reference_mode": coordination_reference_mode if run_coordinated else None,
         "coordination_reference_penalty": coordination_reference_penalty if run_coordinated else None,
+        "price_adapter_mode": coordinated_bundle.get("price_adapter_mode") if run_coordinated else None,
+        "include_reference_penalty_context": (
+            bool(coordinated_bundle.get("include_reference_penalty_context", True))
+            if run_coordinated
+            else None
+        ),
         "local_reference_penalty": local_reference_penalty if run_local else None,
         "adjacency_metadata": adjacency_metadata,
         "coordinator_obs_dim": int(coordinated_bundle["coordinator_obs_dim"]) if run_coordinated else None,
@@ -2091,11 +2326,13 @@ def _run_single_evaluation(
                 "local_stochastic_mean",
                 "coordinated_stochastic_mean",
             )
+    if int(args.stochastic_runs) == 0:
+        report = _without_stochastic_sections(report)
     report["support_plots"] = _save_support_plots(report, report_dir)
     report_path = os.path.join(report_dir, "comparison_coordinated_controller.json")
     report["report_path"] = report_path
     with open(report_path, "w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2)
+        json.dump(report, handle, indent=2, allow_nan=False)
     _print_summary(report)
     if report["support_plots"]:
         print(f"Support plots saved to {os.path.join(report_dir, 'plots')}")
@@ -2188,6 +2425,18 @@ def _build_validation_summary(reports: list[dict], metadata: dict, args, output_
         for report in reports
         if report.get("coordinated_checkpoint_path")
     }
+    local_fingerprints_by_day_type = {
+        str((report.get("episode_demand", {}) or {}).get("day_type")): report.get("local_checkpoint_sha256")
+        for report in reports
+        if report.get("local_checkpoint_sha256")
+    }
+    coordinated_fingerprints_by_day_type = {
+        str((report.get("episode_demand", {}) or {}).get("day_type")): report.get(
+            "coordinated_checkpoint_sha256"
+        )
+        for report in reports
+        if report.get("coordinated_checkpoint_sha256")
+    }
     aggregate = {
         "evaluation_metric_schema_version": EVALUATION_METRIC_SCHEMA_VERSION,
         "architecture_name": "validation_aggregate_baseline_vs_local_vs_coordinated",
@@ -2200,6 +2449,8 @@ def _build_validation_summary(reports: list[dict], metadata: dict, args, output_
         },
         "local_checkpoint_paths_by_day_type": local_paths_by_day_type,
         "coordinated_checkpoint_paths_by_day_type": coordinated_paths_by_day_type,
+        "local_checkpoint_sha256_by_day_type": local_fingerprints_by_day_type,
+        "coordinated_checkpoint_sha256_by_day_type": coordinated_fingerprints_by_day_type,
         "local_checkpoint_compatibility_by_day_type": {
             str((report.get("episode_demand", {}) or {}).get("day_type")): report.get("local_checkpoint_compatibility")
             for report in reports
@@ -2214,7 +2465,9 @@ def _build_validation_summary(reports: list[dict], metadata: dict, args, output_
                 "vehicle_count": (report.get("episode_demand", {}) or {}).get("vehicle_count"),
                 "traffic_flow_file_path": report.get("traffic_flow_file_path"),
                 "local_checkpoint_path": report.get("local_checkpoint_path"),
+                "local_checkpoint_sha256": report.get("local_checkpoint_sha256"),
                 "coordinated_checkpoint_path": report.get("coordinated_checkpoint_path"),
+                "coordinated_checkpoint_sha256": report.get("coordinated_checkpoint_sha256"),
                 "report_path": report.get("report_path"),
                 "route_folder_path": report.get("route_folder_path"),
                 "route_generated": report.get("route_generated"),
@@ -2312,7 +2565,9 @@ def _write_validation_csv(reports: list[dict], csv_path: str):
         "day_type",
         "vehicle_count",
         "local_checkpoint_path",
+        "local_checkpoint_sha256",
         "coordinated_checkpoint_path",
+        "coordinated_checkpoint_sha256",
         "traffic_flow_file_path",
         "baseline_avg_waiting_time",
         "baseline_total_waiting_time",
@@ -2353,7 +2608,9 @@ def _write_validation_csv(reports: list[dict], csv_path: str):
                 "day_type": demand.get("day_type", ""),
                 "vehicle_count": demand.get("vehicle_count", ""),
                 "local_checkpoint_path": report.get("local_checkpoint_path", ""),
+                "local_checkpoint_sha256": report.get("local_checkpoint_sha256", ""),
                 "coordinated_checkpoint_path": report.get("coordinated_checkpoint_path", ""),
+                "coordinated_checkpoint_sha256": report.get("coordinated_checkpoint_sha256", ""),
                 "traffic_flow_file_path": report.get("traffic_flow_file_path", ""),
                 "baseline_avg_waiting_time": _metric_value(report, "baseline", "avg_waiting_time"),
                 "baseline_total_waiting_time": _metric_value(report, "baseline", "total_waiting_time"),
@@ -2507,7 +2764,56 @@ def main():
     run_coordinated = bool(coordinated_checkpoint_entries)
     if not run_local and not run_coordinated:
         raise FileNotFoundError("No usable RL checkpoint found. Provide local and/or coordinated checkpoints.")
+    missing_local_reference = [
+        day_type
+        for day_type, entry in coordinated_checkpoint_entries.items()
+        if _checkpoint_requires_local_reference(entry["checkpoint"])
+        and day_type not in local_checkpoint_entries
+    ]
+    if missing_local_reference:
+        raise ValueError(
+            "The coordinated checkpoint requires a local-controller reference for "
+            f"{', '.join(sorted(missing_local_reference))}. Provide the matching local checkpoint "
+            "instead of falling back to a different baseline context."
+        )
+    local_checkpoint_compatibility = {}
+    if run_local and run_coordinated:
+        for day_type in required_day_types:
+            local_entry = local_checkpoint_entries.get(day_type)
+            coordinated_entry = coordinated_checkpoint_entries.get(day_type)
+            if local_entry is None or coordinated_entry is None:
+                continue
+            audit = _audit_local_checkpoint_compatibility(
+                local_entry["checkpoint"],
+                coordinated_entry["checkpoint"],
+            )
+            local_checkpoint_compatibility[day_type] = audit
+            if (
+                _coordination_reference_mode(coordinated_entry["checkpoint"])
+                in ("local_only", "local_reference")
+                and not audit["same_local_base_weights"]
+            ):
+                raise ValueError(
+                    "The coordinated checkpoint was trained against a different local base "
+                    f"for {day_type}: compared_tensors={audit['compared_tensor_count']}, "
+                    f"missing={audit['missing_tensor_keys'][:5]}, "
+                    f"unexpected={audit['unexpected_tensor_keys'][:5]}, "
+                    f"different={audit['different_tensor_keys'][:5]}, "
+                    "max_abs_difference="
+                    f"{audit['max_abs_local_base_weight_difference']:.6g}. "
+                    "Provide the exact matching local checkpoint."
+                )
     selected_taz_ids = _selected_taz_ids_from_entries(coordinated_checkpoint_entries, local_checkpoint_entries)
+    expected_tls_ids = _checkpoint_metadata_consensus(
+        "tls_ids",
+        coordinated_checkpoint_entries,
+        local_checkpoint_entries,
+    )
+    expected_control_groups = _checkpoint_metadata_consensus(
+        "control_groups_by_taz",
+        coordinated_checkpoint_entries,
+        local_checkpoint_entries,
+    )
 
     sumo_standalone_dir = os.path.join(constants.SUMO_PATH, "standalone")
     log_file = os.path.join(sumo_standalone_dir, "compare_rl_module_coordinated_controller.log")
@@ -2523,6 +2829,26 @@ def main():
 
     try:
         taz_ids = env.get_taz_ids()
+        if selected_taz_ids is not None and list(taz_ids) != list(selected_taz_ids):
+            raise ValueError(
+                "Runtime TAZ IDs/order do not match the checkpoint. "
+                f"checkpoint={list(selected_taz_ids)!r}, runtime={list(taz_ids)!r}"
+            )
+        if (
+            expected_tls_ids is not None
+            and list(env.get_tls_ids()) != list(expected_tls_ids)
+        ):
+            raise ValueError(
+                "Runtime TLS IDs/order do not match the checkpoint; "
+                "local action heads would be applied to different signals."
+            )
+        if (
+            expected_control_groups is not None
+            and env.get_control_groups_by_taz() != expected_control_groups
+        ):
+            raise ValueError(
+                "Runtime control-group definitions/order do not match the checkpoint."
+            )
         taz_polygons = parse_taz_polygons(constants.TAZ_ADDITIONAL_FILE_PATH)
         adjacency_matrix, adjacency_metadata = build_taz_adjacency_matrix(
             taz_ids=taz_ids,
@@ -2536,18 +2862,11 @@ def main():
         if run_coordinated:
             coordinated_checkpoint_entries = _add_coordinated_bundles(coordinated_checkpoint_entries, env, adjacency_matrix)
 
-        local_checkpoint_compatibility = {}
         if run_local and run_coordinated:
             for day_type in required_day_types:
-                local_entry = local_checkpoint_entries.get(day_type)
-                coordinated_entry = coordinated_checkpoint_entries.get(day_type)
-                if local_entry is None or coordinated_entry is None:
+                audit = local_checkpoint_compatibility.get(day_type)
+                if audit is None:
                     continue
-                audit = _audit_local_checkpoint_compatibility(
-                    local_entry["checkpoint"],
-                    coordinated_entry["checkpoint"],
-                )
-                local_checkpoint_compatibility[day_type] = audit
                 if not audit["incremental_comparison_valid"]:
                     print(
                         "[WARN] Local-vs-coordinated does not isolate the coordinator contribution for "
@@ -2567,6 +2886,8 @@ def main():
                     episode,
                     local_entry["path"] if local_entry else None,
                     coordinated_entry["path"] if coordinated_entry else None,
+                    local_entry["sha256"] if local_entry else None,
+                    coordinated_entry["sha256"] if coordinated_entry else None,
                 )
                 if resumed_report is not None:
                     reports.append(resumed_report)
@@ -2589,6 +2910,8 @@ def main():
                     checkpoint=coordinated_entry["checkpoint"] if coordinated_entry else None,
                     local_checkpoint_path=local_entry["path"] if local_entry else None,
                     coordinated_checkpoint_path=coordinated_entry["path"] if coordinated_entry else None,
+                    local_checkpoint_sha256=local_entry["sha256"] if local_entry else None,
+                    coordinated_checkpoint_sha256=coordinated_entry["sha256"] if coordinated_entry else None,
                     sumo=sumo,
                     planner=planner,
                     env=env,

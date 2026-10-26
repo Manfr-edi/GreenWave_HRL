@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Central configuration for the RL package.
 
 The goal is to keep experiment choices out of the training loops. Training
@@ -7,6 +5,8 @@ scripts import immutable settings from here, while output paths are derived from
 the architecture name so local-only and coordinated runs never overwrite each
 other.
 """
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
@@ -192,8 +192,17 @@ class CoordinatorSettings:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     coordination_reference_mode: str = "local_only"
+    # The local-reference terminal penalty is a training target, not information
+    # available to an online controller before it acts.
+    include_reference_penalty_context: bool = False
     price_adapter_hidden_dim: int = 64
-    price_adapter_scale: float = 10.0
+    price_adapter_scale: float = 1.0
+    price_adapter_mode: str = "zero_anchored_v2"
+    normalize_entropy_and_kl_by_taz: bool = True
+    # A route-dependent one-episode reward is not a reliable LR scheduler
+    # signal. Keep the coordinator LR constant unless a validation scheduler is
+    # introduced explicitly.
+    use_lr_scheduler: bool = False
 
 
 EXPERIMENT = ExperimentSettings()

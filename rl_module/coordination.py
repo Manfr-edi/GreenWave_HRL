@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Global coordination state, adjacency, and reward shaping utilities."""
+
+from __future__ import annotations
 
 import math
 import xml.etree.ElementTree as ET
@@ -37,6 +37,7 @@ class CoordinationObservationConfig:
 class CoordinationRewardConfig:
     """Weights used by the emission-first coordinator reward."""
 
+    reward_semantics_version: int = 2
     emission_mean_penalty_weight: float = 1.50
     worst_taz_emission_weight: float = 0.75
     emission_mean_delta_weight: float = 0.35
@@ -45,7 +46,10 @@ class CoordinationRewardConfig:
     emission_imbalance_weight: float = 0.75
     emission_spillover_weight: float = 0.75
     price_emission_alignment_weight: float = 0.10
-    terminal_delta_weight: float = 1.00
+    # The paired terminal delta is the only direct signal that the coordinated
+    # policy beat the frozen local controller on the same route. Give it enough
+    # weight to remain visible beside the accumulated dense penalties.
+    terminal_delta_weight: float = 5.00
     city_delta_weight: float = 1.00
     imbalance_weight: float = 0.25
     spillover_weight: float = 0.85
@@ -421,7 +425,14 @@ def compute_coordination_step_rewards(
     normalized_price = prices / _price_normalizer(price_max)
     action_effort = _dict_values_by_taz(taz_ids, action_summary_by_taz, "aggressive_action_ratio").to(device=device, dtype=dtype)
     flow_intensity = torch.clamp(flow.sum(dim=-1) / max(float(cfg.flow_ref), 1e-6), min=0.0, max=2.0)
-    downstream_cost = flow_share.matmul(normalized_price * emission_worsening)
+    if int(cfg.reward_semantics_version) <= 1:
+        # Reproduce diagnostics for existing checkpoints.
+        downstream_cost = flow_share.matmul(normalized_price * emission_worsening)
+    else:
+        # Externality is a property of downstream traffic/emissions.
+        # Multiplying it by the coordinator's own price let the policy reduce
+        # its penalty simply by selecting zero, without changing emissions.
+        downstream_cost = flow_share.matmul(emission_worsening)
     emission_externality = torch.clamp(
         downstream_cost * (1.0 + cfg.action_effort_weight * action_effort) * (1.0 + 0.25 * flow_intensity)
         - 0.25 * emission_gain,

@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Generic PPO utilities used by all RL trainers."""
+
+from __future__ import annotations
 
 import copy
 import math
@@ -75,10 +75,12 @@ def ppo_update(
     value_coef=0.5,
     target_kl=None,
     max_grad_norm=0.5,
+    joint_action_dim: int = 1,
 ):
     """Run PPO over a flattened rollout batch."""
 
     n_samples = obs.shape[0]
+    policy_term_normalizer = max(int(joint_action_dim), 1)
     idx = torch.arange(n_samples, device=obs.device)
     batch_size = min(int(minibatch_size), n_samples)
     planned_updates = int(ppo_epochs) * max(int(math.ceil(n_samples / batch_size)), 1)
@@ -104,7 +106,8 @@ def ppo_update(
             surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv[mb_idx]
             policy_loss = -torch.min(surr1, surr2).mean()
             value_loss = nn.functional.mse_loss(values, ret[mb_idx])
-            total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+            normalized_entropy = entropy / float(policy_term_normalizer)
+            total_loss = policy_loss + value_coef * value_loss - entropy_coef * normalized_entropy.mean()
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -112,11 +115,17 @@ def ppo_update(
             optimizer.step()
             performed_updates += 1
 
-            approx_kl = (logp_old[mb_idx] - logp).mean().item()
+            # The likelihood ratio still uses the full joint action. Only the
+            # regularizer and early-stop diagnostic are expressed per action
+            # head so their configured scales do not grow with the number of
+            # TAZs controlled by the coordinator.
+            approx_kl = (
+                (logp_old[mb_idx] - logp).mean() / float(policy_term_normalizer)
+            ).item()
             epoch_kls.append(float(approx_kl))
             kls.append(float(approx_kl))
             clip_fracs.append(float((torch.abs(ratio - 1.0) > clip_ratio).float().mean().item()))
-            entropies.append(float(entropy.mean().item()))
+            entropies.append(float(normalized_entropy.mean().item()))
             last_policy_loss = float(policy_loss.item())
             last_value_loss = float(value_loss.item())
             last_total_loss = float(total_loss.item())
